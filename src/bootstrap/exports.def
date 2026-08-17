@@ -1,0 +1,4 @@
+LIBRARY sc13modloader
+EXPORTS
+    SC13_Initialize=_SC13_Initialize@4
+    SC13_Shutdown=_SC13_Shutdown@4

@@ -1,0 +1,11 @@
+/build/
+/logs/
+/captures/
+/.vs/
+*.package
+*.pdb
+*.ilk
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
