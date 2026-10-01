@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <WindowsSdkPackageVersion>10.0.26100.70</WindowsSdkPackageVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="2.0.0" />
+    <ProjectReference Include="..\Simoder.DevBridge.Core\Simoder.DevBridge.Core.csproj" />
+    <ProjectReference Include="..\Simoder.DevBridge\Simoder.DevBridge.csproj" />
+    <ProjectReference Include="..\Simoder.McpServer\Simoder.McpServer.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\scripts\Register-Simoder-MCP.ps1" Link="Register-Simoder-MCP.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\scripts\Unregister-Simoder-MCP.ps1" Link="Unregister-Simoder-MCP.ps1" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

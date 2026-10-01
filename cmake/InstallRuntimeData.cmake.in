@@ -1,0 +1,22 @@
+# /** Installs mutable defaults only when the end user has no existing copy. */
+set(sc13_source_root "@CMAKE_CURRENT_SOURCE_DIR@")
+
+if(NOT EXISTS "${CMAKE_INSTALL_PREFIX}/simoder/config.toon")
+    file(
+        INSTALL
+        DESTINATION "${CMAKE_INSTALL_PREFIX}/simoder"
+        TYPE FILE
+        FILES "${sc13_source_root}/packaging/config.toon"
+    )
+endif()
+
+foreach(sc13_mod_file mod.toon overrides.toon)
+    if(NOT EXISTS "${CMAKE_INSTALL_PREFIX}/mods/BetterSanitizer/${sc13_mod_file}")
+        file(
+            INSTALL
+            DESTINATION "${CMAKE_INSTALL_PREFIX}/mods/BetterSanitizer"
+            TYPE FILE
+            FILES "${sc13_source_root}/packaging/BetterSanitizer/${sc13_mod_file}"
+        )
+    endif()
+endforeach()

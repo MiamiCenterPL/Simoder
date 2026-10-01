@@ -1,0 +1,14 @@
+# /** Installs the already-built optional self-contained AI DevTools payload. */
+set(_sc13_ai_publish_dir "@CMAKE_CURRENT_BINARY_DIR@/ai-devtools/${CMAKE_INSTALL_CONFIG_NAME}")
+if(NOT IS_DIRECTORY "${_sc13_ai_publish_dir}")
+    message(FATAL_ERROR
+        "Optional AI DevTools were not built for ${CMAKE_INSTALL_CONFIG_NAME}. "
+        "Build the sc13-ai-devtools target before installing."
+    )
+endif()
+
+file(
+    INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/simoder/DevTools/AI"
+    TYPE DIRECTORY
+    FILES "${_sc13_ai_publish_dir}/"
+)

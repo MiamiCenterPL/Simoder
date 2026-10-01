@@ -51,11 +51,11 @@ private:
 void PrintUsage() {
     std::wcerr
         << L"Usage:\n"
-        << L"  sc13-launcher --self-check [dll-path]\n"
-        << L"  sc13-launcher --attach [pid] [dll-path]\n"
-        << L"  sc13-launcher --watch-attach <excluded-pid> [dll-path]\n"
-        << L"  sc13-launcher --detach <pid> [dll-path]\n"
-        << L"  sc13-launcher --launch <SimCity.exe> [dll-path]\n";
+        << L"  simoder --self-check [dll-path]\n"
+        << L"  simoder --attach [pid] [dll-path]\n"
+        << L"  simoder --watch-attach <excluded-pid> [dll-path]\n"
+        << L"  simoder --detach <pid> [dll-path]\n"
+        << L"  simoder --launch <SimCity.exe> [dll-path]\n";
 }
 
 /** Resolves the default DLL next to the launcher executable. */
@@ -659,7 +659,7 @@ int wmain(int argumentCount, wchar_t** arguments) {
             std::wcerr << L"Injection failed: " << error << L"\n";
             return 1;
         }
-        std::wcout << L"SC13 observation mode initialized in PID " << processId << L".\n";
+        std::wcout << L"Simoder runtime initialized in PID " << processId << L".\n";
         return 0;
     }
 
@@ -814,7 +814,7 @@ int wmain(int argumentCount, wchar_t** arguments) {
             std::wcerr << L"ResumeThread failed; child was terminated.\n";
             return 1;
         }
-        std::wcout << L"SimCity launched with SC13 observation mode in PID "
+        std::wcout << L"SimCity launched with Simoder runtime in PID "
                    << processInfo.dwProcessId << L".\n";
         return 0;
     }

@@ -1,0 +1,6 @@
+developerConsole:
+  enabled: false
+  captureGameLogs: true
+  captureLoaderLogs: true
+  captureModLogs: true
+  level: info

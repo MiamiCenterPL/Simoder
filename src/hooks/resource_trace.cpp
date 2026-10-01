@@ -1,23 +1,23 @@
 #include "hooks/resource_trace.hpp"
 
-#include "core/patched_resource_cache.hpp"
-#include "core/resource_filter.hpp"
 #include "core/runtime_property_table.hpp"
 #include "core/tgi.hpp"
 #include "logging/async_logger.hpp"
+#include "mods/patch_registry.hpp"
 #include "reverse/resource_symbols.hpp"
 #include "runtime/patch_signal.hpp"
+#include "runtime/runtime_resource_cache.hpp"
 
 #include <Windows.h>
 #include <MinHook.h>
 
+#include <algorithm>
 #include <array>
-#include <atomic>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace sc13::hooks {
 namespace {
@@ -27,19 +27,9 @@ using PFRecordReadConstructor = void*(__thiscall*)(
 using PublishParsedResource = void(__cdecl*)(void*, void*, std::uint32_t);
 using PropDeserialize = bool(__thiscall*)(void*, void*);
 
-constexpr std::uint32_t kTargetType = 0x00B1B104U;
-constexpr std::uint32_t kTargetGroup = 0x61EFC000U;
-constexpr std::uint32_t kTargetInstance = 0x719436BDU;
-constexpr core::ResourceFilter kTargetFilter{
-    kTargetType, kTargetGroup, kTargetInstance};
-constexpr std::size_t kExpectedPropertyCount = 89U;
-constexpr std::array<std::uint32_t, 4> kObservedProperties{
-    0x09AE19D7U, 0x0AFB9882U, 0x0C09DA83U, 0x0FD16C15U};
-constexpr std::array<float, 4> kExpectedPropertyValues{300.0F, 72.0F, 2.0F, 200.0F};
-constexpr core::RuntimeFloatPatch kMaintenancePatch{0x09AE19D7U, 300.0F, 345.0F};
-constexpr std::size_t kTrackedPatchCapacity = 8U;
+constexpr std::size_t kMaximumPropertyCount = 4096U;
 
-/** Mirrors the verified x86 prefix passed to the parsed-resource publisher. */
+/** Mirrors the verified x86 prefix produced by the game's PROP deserializer. */
 struct ParsedResourcePrefix final {
     std::uint32_t vtable{};
     std::uint32_t unknown{};
@@ -54,32 +44,41 @@ struct ParsedResourcePrefix final {
 
 static_assert(sizeof(ParsedResourcePrefix) == 36U);
 
-/** Retains enough identity to restore one exact game-managed float safely. */
-struct AppliedRuntimePatch final {
-    std::uintptr_t resourceAddress{};
-    std::uintptr_t tableBegin{};
-    std::uintptr_t valueAddress{};
-    std::uint32_t originalBits{};
-    std::uint32_t replacementBits{};
-};
-
 PFRecordReadConstructor g_originalPFRecordReadConstructor = nullptr;
 PublishParsedResource g_originalPublishParsedResource = nullptr;
 PropDeserialize g_originalPropDeserialize = nullptr;
-SRWLOCK g_patchLock = SRWLOCK_INIT;
-std::array<AppliedRuntimePatch, kTrackedPatchCapacity> g_appliedPatches{};
-core::PatchedResourceCache g_patchedResourceCache;
+mods::PatchRegistry* g_registry = nullptr;
+runtime::RuntimeResourceCache* g_cache = nullptr;
+SRWLOCK g_writeLock = SRWLOCK_INIT;
 
-/** Copies a current-process address range without directly dereferencing untrusted pointers. */
+/** Releases one exclusive SRW lock on every exit path. */
+class ExclusiveSrwLock final {
+public:
+    /** Acquires the supplied lock exclusively. */
+    explicit ExclusiveSrwLock(SRWLOCK& lock) noexcept : lock_(lock) {
+        AcquireSRWLockExclusive(&lock_);
+    }
+
+    /** Releases the lock after the guarded operation. */
+    ~ExclusiveSrwLock() { ReleaseSRWLockExclusive(&lock_); }
+
+    ExclusiveSrwLock(const ExclusiveSrwLock&) = delete;
+    ExclusiveSrwLock& operator=(const ExclusiveSrwLock&) = delete;
+
+private:
+    SRWLOCK& lock_;
+};
+
+/** Copies a current-process address range without dereferencing an unchecked pointer. */
 [[nodiscard]] bool ReadCurrentProcess(
     std::uintptr_t address,
     void* destination,
     std::size_t size) noexcept {
-    SIZE_T bytesRead = 0;
-    return address != 0U &&
+    SIZE_T bytesRead = 0U;
+    return address != 0U && destination != nullptr && size != 0U &&
            ReadProcessMemory(
-               GetCurrentProcess(), reinterpret_cast<const void*>(address), destination, size,
-               &bytesRead) != FALSE &&
+               GetCurrentProcess(), reinterpret_cast<const void*>(address), destination,
+               size, &bytesRead) != FALSE &&
            bytesRead == size;
 }
 
@@ -100,11 +99,11 @@ core::PatchedResourceCache g_patchedResourceCache;
         (information.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0U) {
         return false;
     }
-    const DWORD baseProtection = information.Protect & 0xFFU;
-    const bool writable = baseProtection == PAGE_READWRITE ||
-                          baseProtection == PAGE_WRITECOPY ||
-                          baseProtection == PAGE_EXECUTE_READWRITE ||
-                          baseProtection == PAGE_EXECUTE_WRITECOPY;
+    const DWORD protection = information.Protect & 0xFFU;
+    const bool writable = protection == PAGE_READWRITE ||
+                          protection == PAGE_WRITECOPY ||
+                          protection == PAGE_EXECUTE_READWRITE ||
+                          protection == PAGE_EXECUTE_WRITECOPY;
     if (!writable) {
         return false;
     }
@@ -114,228 +113,317 @@ core::PatchedResourceCache g_patchedResourceCache;
     return true;
 }
 
-/** Logs a bounded module-relative call stack for a matched target resource key. */
-void LogTargetStack() noexcept {
-    std::array<void*, 16> frames{};
-    const USHORT captured = CaptureStackBackTrace(
-        2, static_cast<DWORD>(frames.size()), frames.data(), nullptr);
-    for (USHORT index = 0; index < captured; ++index) {
-        HMODULE module = nullptr;
-        if (GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(frames[index]), &module) == FALSE) {
-            logging::AsyncLogger::Instance().WriteFormat(
-                logging::Level::Trace,
-                "  target-stack[%u] address=%p module=unknown", index, frames[index]);
-            continue;
+/** Compares complete property records without depending on structure padding. */
+[[nodiscard]] bool EqualRecords(
+    std::span<const core::RuntimePropertyRecord> left,
+    std::span<const core::RuntimePropertyRecord> right) noexcept {
+    return left.size() == right.size() &&
+           std::equal(
+               left.begin(), left.end(), right.begin(),
+               [](const core::RuntimePropertyRecord& first,
+                  const core::RuntimePropertyRecord& second) {
+                   return first.id == second.id &&
+                          first.valueBits == second.valueBits &&
+                          first.auxiliary == second.auxiliary &&
+                          first.metadata == second.metadata;
+               });
+}
+
+/** Validates one game-owned PROP vector and copies it into loader-owned storage. */
+[[nodiscard]] bool ReadPropertyTable(
+    const ParsedResourcePrefix& prefix,
+    std::vector<core::RuntimePropertyRecord>& properties,
+    std::string& error) noexcept {
+    try {
+        properties.clear();
+        if (prefix.reserved != 0U || prefix.propertyBegin == 0U ||
+            prefix.propertyEnd < prefix.propertyBegin ||
+            prefix.propertyEnd != prefix.propertyCapacity ||
+            (prefix.propertyBegin &
+             (alignof(core::RuntimePropertyRecord) - 1U)) != 0U) {
+            error = "PROP vector bounds or alignment are invalid";
+            return false;
         }
-        std::array<wchar_t, 1024> modulePath{};
-        GetModuleFileNameW(
-            module, modulePath.data(), static_cast<DWORD>(modulePath.size()));
-        const auto rva = reinterpret_cast<std::uintptr_t>(frames[index]) -
-                         reinterpret_cast<std::uintptr_t>(module);
-        logging::AsyncLogger::Instance().WriteFormat(
-            logging::Level::Trace, "  target-stack[%u] %ls+0x%08llX", index,
-            modulePath.data(), static_cast<unsigned long long>(rva));
+        const std::size_t byteSize =
+            static_cast<std::size_t>(prefix.propertyEnd - prefix.propertyBegin);
+        if (byteSize == 0U ||
+            byteSize % sizeof(core::RuntimePropertyRecord) != 0U) {
+            error = "PROP vector byte length is not a non-empty record sequence";
+            return false;
+        }
+        const std::size_t count = byteSize / sizeof(core::RuntimePropertyRecord);
+        if (count > kMaximumPropertyCount) {
+            error = "PROP vector exceeds the runtime safety limit";
+            return false;
+        }
+        properties.resize(count);
+        if (!ReadCurrentProcess(prefix.propertyBegin, properties.data(), byteSize)) {
+            properties.clear();
+            error = "PROP vector could not be copied from game memory";
+            return false;
+        }
+        if (core::ValidateRuntimePropertyTable(properties, count) !=
+            core::RuntimeTableStatus::Valid) {
+            properties.clear();
+            error = "PROP vector structure is invalid";
+            return false;
+        }
+        return true;
+    } catch (...) {
+        properties.clear();
+        error = "PROP vector copy failed due to an allocation exception";
+        return false;
     }
 }
 
-/** Records and applies one exact maintenance float write to game-managed memory. */
-[[nodiscard]] bool ApplyMaintenancePatch(
-    void* resource,
+/** Applies only value-bit differences and rolls all earlier writes back on failure. */
+[[nodiscard]] bool ApplyValueTransition(
     const ParsedResourcePrefix& prefix,
-    std::span<const core::RuntimePropertyRecord> original,
-    const core::RuntimeResourceCopy& patchedCopy,
-    core::PatchedCacheStatus cacheStatus) noexcept {
-    const core::RuntimePropertyRecord* const originalProperty =
-        core::FindRuntimeProperty(original, kMaintenancePatch.identifier);
-    const core::RuntimePropertyRecord* const patchedProperty =
-        core::FindRuntimeProperty(patchedCopy.records(), kMaintenancePatch.identifier);
-    if (originalProperty == nullptr || patchedProperty == nullptr) {
+    std::span<const core::RuntimePropertyRecord> from,
+    std::span<const core::RuntimePropertyRecord> to,
+    std::size_t& changedCount) noexcept {
+    changedCount = 0U;
+    if (from.size() != to.size()) {
         return false;
     }
-    const std::size_t recordIndex =
-        static_cast<std::size_t>(originalProperty - original.data());
-    const std::uintptr_t valueAddress =
-        prefix.propertyBegin + recordIndex * sizeof(core::RuntimePropertyRecord) +
-        offsetof(core::RuntimePropertyRecord, valueBits);
-    const std::uint32_t expectedBits =
-        std::bit_cast<std::uint32_t>(kMaintenancePatch.expectedValue);
-    const std::uint32_t replacementBits = patchedProperty->valueBits;
-
-    AcquireSRWLockExclusive(&g_patchLock);
-    AppliedRuntimePatch* available = nullptr;
-    for (AppliedRuntimePatch& site : g_appliedPatches) {
-        if (site.valueAddress == valueAddress) {
-            available = &site;
-            break;
+    std::vector<std::size_t> written;
+    try {
+        written.reserve(from.size());
+        for (std::size_t index = 0U; index < from.size(); ++index) {
+            if (from[index].id != to[index].id ||
+                from[index].auxiliary != to[index].auxiliary ||
+                from[index].metadata != to[index].metadata) {
+                return false;
+            }
+            if (from[index].valueBits == to[index].valueBits) {
+                continue;
+            }
+            const std::uintptr_t address =
+                prefix.propertyBegin +
+                index * sizeof(core::RuntimePropertyRecord) +
+                offsetof(core::RuntimePropertyRecord, valueBits);
+            std::uint32_t observed = 0U;
+            if (!CompareExchangeDword(
+                    address, from[index].valueBits, to[index].valueBits, observed) ||
+                observed != from[index].valueBits) {
+                for (auto rollback = written.rbegin(); rollback != written.rend(); ++rollback) {
+                    const std::uintptr_t rollbackAddress =
+                        prefix.propertyBegin +
+                        *rollback * sizeof(core::RuntimePropertyRecord) +
+                        offsetof(core::RuntimePropertyRecord, valueBits);
+                    std::uint32_t rollbackObserved = 0U;
+                    const bool rolledBack = CompareExchangeDword(
+                        rollbackAddress, to[*rollback].valueBits,
+                        from[*rollback].valueBits, rollbackObserved);
+                    if (!rolledBack || rollbackObserved != to[*rollback].valueBits) {
+                        logging::AsyncLogger::Instance().WriteFormat(
+                            logging::Level::Error,
+                            "[SC13][PATCH] transactional rollback refused at address=%p",
+                            reinterpret_cast<void*>(rollbackAddress));
+                    }
+                }
+                return false;
+            }
+            written.push_back(index);
         }
-        if (available == nullptr && site.valueAddress == 0U) {
-            available = &site;
+        changedCount = written.size();
+        return true;
+    } catch (...) {
+        for (auto rollback = written.rbegin(); rollback != written.rend(); ++rollback) {
+            const std::uintptr_t rollbackAddress =
+                prefix.propertyBegin +
+                *rollback * sizeof(core::RuntimePropertyRecord) +
+                offsetof(core::RuntimePropertyRecord, valueBits);
+            std::uint32_t observed = 0U;
+            const bool rolledBack = CompareExchangeDword(
+                rollbackAddress, to[*rollback].valueBits,
+                from[*rollback].valueBits, observed);
+            static_cast<void>(rolledBack);
+        }
+        return false;
+    }
+}
+
+/** Writes and commits one prepared resource generation with transactional rollback. */
+[[nodiscard]] bool ApplyAndCommitPlan(
+    const ParsedResourcePrefix& prefix,
+    const runtime::RuntimeResourceBuildPlan& plan,
+    std::size_t& changedCount,
+    std::string& error) noexcept {
+    bool written = false;
+    bool committed = false;
+    {
+        const ExclusiveSrwLock writeLock(g_writeLock);
+        written = ApplyValueTransition(
+            prefix, plan.previous, plan.desired, changedCount);
+        committed = written && g_cache != nullptr && g_cache->Commit(plan, error);
+        if (!committed && written && changedCount != 0U) {
+            std::size_t rollbackCount = 0U;
+            const bool rolledBack = ApplyValueTransition(
+                prefix, plan.desired, plan.previous, rollbackCount);
+            if (!rolledBack) {
+                logging::AsyncLogger::Instance().Write(
+                    logging::Level::Error,
+                    "[SC13][PATCH] cache commit race rollback was incomplete");
+            }
         }
     }
-    std::uint32_t observedBits = 0U;
-    const bool exchanged = available != nullptr && CompareExchangeDword(
-        valueAddress, expectedBits, replacementBits, observedBits);
-    const bool written = exchanged &&
-        (observedBits == expectedBits ||
-         (available->valueAddress == valueAddress && observedBits == replacementBits));
-    if (written) {
-        *available = AppliedRuntimePatch{
-            reinterpret_cast<std::uintptr_t>(resource), prefix.propertyBegin, valueAddress,
-            expectedBits, replacementBits};
+    if (!written && error.empty()) {
+        error = "game memory changed concurrently";
     }
-    ReleaseSRWLockExclusive(&g_patchLock);
+    return written && committed;
+}
 
-    if (written) {
+/** Rebuilds one matched resource from retained vanilla and the current registry snapshot. */
+void PatchDeserializedResource(
+    void* resource,
+    void* reader,
+    bool deserializeResult) noexcept {
+    try {
+        if (resource == nullptr || !deserializeResult ||
+            g_registry == nullptr || g_cache == nullptr) {
+            return;
+        }
+        ParsedResourcePrefix prefix{};
+        if (!ReadCurrentProcess(
+                reinterpret_cast<std::uintptr_t>(resource), &prefix, sizeof(prefix))) {
+            return;
+        }
+        const core::Tgi target{prefix.type, prefix.group, prefix.instance};
+        const runtime::RuntimeResourceKey key{
+            target, reinterpret_cast<std::uintptr_t>(resource)};
+        const std::shared_ptr<const mods::PatchRegistrySnapshot> snapshot =
+            g_registry->Current();
+        const std::vector<mods::RegisteredPatch>* const registered =
+            snapshot->Find(target);
+        if (registered == nullptr && !g_cache->Contains(key)) {
+            return;
+        }
+
+        std::vector<core::RuntimePropertyRecord> current;
+        std::string error;
+        if (!ReadPropertyTable(prefix, current, error)) {
+            logging::AsyncLogger::Instance().WriteFormat(
+                logging::Level::Error,
+                "[SC13][PATCH] TGI=%s resource=%p rejected: %s; fail-open",
+                core::ToString(target).c_str(), resource, error.c_str());
+            return;
+        }
+        const std::span<const mods::RegisteredPatch> patches =
+            registered == nullptr ? std::span<const mods::RegisteredPatch>{}
+                                  : std::span<const mods::RegisteredPatch>(*registered);
+        runtime::RuntimeResourceBuildPlan plan;
+        if (!g_cache->Prepare(
+                key, current, snapshot->generation(), patches, plan, error)) {
+            logging::AsyncLogger::Instance().WriteFormat(
+                logging::Level::Error,
+                "[SC13][PATCH] TGI=%s resource=%p rebuild rejected: %s; fail-open",
+                core::ToString(target).c_str(), resource, error.c_str());
+            return;
+        }
+
+        std::size_t changedCount = 0U;
+        if (!ApplyAndCommitPlan(prefix, plan, changedCount, error)) {
+            logging::AsyncLogger::Instance().WriteFormat(
+                logging::Level::Error,
+                "[SC13][PATCH] TGI=%s resource=%p transactional write refused: %s; fail-open",
+                core::ToString(target).c_str(), resource,
+                error.empty() ? "game memory changed concurrently" : error.c_str());
+            return;
+        }
         logging::AsyncLogger::Instance().WriteFormat(
-            logging::Level::Info,
-            "[SC13][PATCH] TGI=%s id=0x%08X old=%.3f new=%.3f address=%p "
-            "bytes=4 cache=%s status=%s",
-            core::ToString(patchedCopy.tgi()).c_str(), kMaintenancePatch.identifier,
-            kMaintenancePatch.expectedValue, kMaintenancePatch.replacementValue,
-            reinterpret_cast<void*>(valueAddress),
-            cacheStatus == core::PatchedCacheStatus::Created ? "created" : "reused",
-            observedBits == replacementBits ? "already-applied" : "applied");
-        if (!runtime::SignalPatchApplied()) {
+            logging::Level::Patch,
+            "[SC13][PATCH] TGI=%s resource=%p reader=%p generation=%llu "
+            "patchOwners=%zu changedValues=%zu cache=%s",
+            core::ToString(target).c_str(), resource, reader,
+            static_cast<unsigned long long>(snapshot->generation()), patches.size(),
+            changedCount, runtime::RuntimeResourceBuildStatusName(plan.status));
+        for (const mods::RegisteredPatch& patch : patches) {
+            logging::AsyncLogger::Instance().WriteEventFormat(
+                logging::Level::Patch,
+                logging::SourceType::Mod,
+                patch.owner.c_str(),
+                "Applied resource TGI=%s generation=%llu changedValues=%zu",
+                core::ToString(target).c_str(),
+                static_cast<unsigned long long>(snapshot->generation()),
+                changedCount);
+        }
+        if (changedCount != 0U && !runtime::SignalPatchApplied()) {
             logging::AsyncLogger::Instance().Write(
                 logging::Level::Warning,
                 "[SC13][PATCH] Runtime write succeeded but patch-applied signal failed");
         }
-    }
-    return written;
-}
-
-/** Validates and patches one target PROP table at its earliest verified boundary. */
-void PatchDeserializedTarget(void* resource, void* reader, bool deserializeResult) noexcept {
-    if (resource == nullptr) {
-        return;
-    }
-    std::array<std::uint32_t, 3> identityWords{};
-    std::memcpy(
-        identityWords.data(), static_cast<const std::byte*>(resource) + 0x08U,
-        sizeof(identityWords));
-    const core::Tgi tgi{identityWords[1], identityWords[2], identityWords[0]};
-    if (!kTargetFilter.Matches(tgi)) {
-        return;
-    }
-
-    ParsedResourcePrefix prefix{};
-    const bool prefixCopied = ReadCurrentProcess(
-        reinterpret_cast<std::uintptr_t>(resource), &prefix, sizeof(prefix));
-    std::array<core::RuntimePropertyRecord, kExpectedPropertyCount> properties{};
-    const bool boundsValid = prefixCopied && prefix.reserved == 0U &&
-                             prefix.propertyBegin != 0U &&
-                             prefix.propertyEnd >= prefix.propertyBegin &&
-                             prefix.propertyEnd - prefix.propertyBegin ==
-                                 properties.size() * sizeof(properties.front()) &&
-                              prefix.propertyCapacity == prefix.propertyEnd &&
-                              (prefix.propertyBegin &
-                               (alignof(core::RuntimePropertyRecord) - 1U)) == 0U;
-    const bool copied = boundsValid && ReadCurrentProcess(
-        prefix.propertyBegin, properties.data(), sizeof(properties));
-    const bool tableValid = copied &&
-        core::ValidateRuntimePropertyTable(properties, kExpectedPropertyCount) ==
-            core::RuntimeTableStatus::Valid;
-    std::array<float, kObservedProperties.size()> values{};
-    bool valuesValid = tableValid;
-    for (std::size_t index = 0; index < kObservedProperties.size() && valuesValid; ++index) {
-        const auto value = core::ReadRuntimeFloat(properties, kObservedProperties[index]);
-        valuesValid = value.has_value();
-        if (value.has_value()) {
-            values[index] = value.value();
-        }
-    }
-    bool baselineValid = deserializeResult && valuesValid;
-    for (std::size_t index = 0; index < values.size() && baselineValid; ++index) {
-        baselineValid = values[index] == kExpectedPropertyValues[index];
-    }
-
-    logging::AsyncLogger::Instance().WriteFormat(
-        baselineValid ? logging::Level::Info : logging::Level::Error,
-        "[SC13][PROP-DESERIALIZE] thread=%lu TGI=%s result=%s resource=%p reader=%p "
-        "bounds=%s table=%s baseline=%s mode=patch-candidate fail-open",
-        GetCurrentThreadId(), core::ToString(tgi).c_str(),
-        deserializeResult ? "success" : "failure", resource, reader,
-        boundsValid ? "valid" : "invalid", tableValid ? "valid" : "invalid",
-        baselineValid ? "verified" : "rejected");
-    if (valuesValid) {
-        for (std::size_t index = 0; index < kObservedProperties.size(); ++index) {
-            logging::AsyncLogger::Instance().WriteFormat(
-                logging::Level::Info, "[SC13][PROP-DESERIALIZE] id=0x%08X float=%.3f",
-                kObservedProperties[index], values[index]);
-        }
-    }
-    LogTargetStack();
-
-    if (!baselineValid) {
+    } catch (...) {
         logging::AsyncLogger::Instance().Write(
-            logging::Level::Warning,
-            "[SC13][PATCH] Target baseline rejected; original runtime resource remains unchanged");
-        return;
-    }
-    core::PatchedCacheStatus cacheStatus{};
-    std::string cacheError;
-    const core::RuntimeResourceCopy* const patchedCopy =
-        g_patchedResourceCache.GetOrCreate(
-            tgi, properties, kExpectedPropertyCount, kMaintenancePatch, cacheStatus,
-            cacheError);
-    if (patchedCopy == nullptr ||
-        !ApplyMaintenancePatch(resource, prefix, properties, *patchedCopy, cacheStatus)) {
-        logging::AsyncLogger::Instance().WriteFormat(
             logging::Level::Error,
-            "[SC13][PATCH] Exact maintenance patch refused: %s; fail-open",
-            cacheError.empty() ? "runtime write validation failed" : cacheError.c_str());
+            "[SC13][PATCH] Resource hook caught an exception and failed open");
     }
 }
 
-/** Intercepts the concrete PROP deserializer and observes its completed target table. */
+/** Intercepts the verified PROP deserializer after its game-owned table is complete. */
 bool __fastcall HookPropDeserialize(
     void* self,
     void*,
     void* reader) noexcept {
     const bool result = g_originalPropDeserialize(self, reader);
-    PatchDeserializedTarget(self, reader, result);
+    PatchDeserializedResource(self, reader, result);
     return result;
 }
 
-/** Restores tracked target floats only while their resource identity and bytes still match. */
-void RestoreRuntimePatches() noexcept {
-    AcquireSRWLockExclusive(&g_patchLock);
-    for (AppliedRuntimePatch& site : g_appliedPatches) {
-        if (site.valueAddress == 0U) {
-            continue;
-        }
-        ParsedResourcePrefix prefix{};
-        std::uint32_t currentBits = 0U;
-        const bool readable =
-            ReadCurrentProcess(site.resourceAddress, &prefix, sizeof(prefix)) &&
-            ReadCurrentProcess(site.valueAddress, &currentBits, sizeof(currentBits));
-        const core::Tgi tgi{prefix.type, prefix.group, prefix.instance};
-        const bool identityValid = readable && kTargetFilter.Matches(tgi) &&
-                                   prefix.reserved == 0U &&
-                                   prefix.propertyBegin == site.tableBegin &&
-                                   prefix.propertyEnd == prefix.propertyCapacity &&
-                                   site.valueAddress >= prefix.propertyBegin &&
-                                   site.valueAddress + sizeof(currentBits) <= prefix.propertyEnd;
-        std::uint32_t observedBits = 0U;
-        const bool exchanged = identityValid && CompareExchangeDword(
-            site.valueAddress, site.replacementBits, site.originalBits, observedBits);
-        const bool restored = exchanged && observedBits == site.replacementBits;
-        const bool alreadyOriginal = exchanged && observedBits == site.originalBits;
-        logging::AsyncLogger::Instance().WriteFormat(
-            restored || alreadyOriginal ? logging::Level::Info : logging::Level::Warning,
-            "[SC13][PATCH] rollback address=%p status=%s",
-            reinterpret_cast<void*>(site.valueAddress),
-            restored ? "restored-300" : alreadyOriginal ? "already-300" : "skipped");
-        site = {};
+/** Restores every retained live resource when its identity and last result still match. */
+void RestoreRuntimeResources() noexcept {
+    if (g_cache == nullptr) {
+        return;
     }
-    ReleaseSRWLockExclusive(&g_patchLock);
-    g_patchedResourceCache.Clear();
+    try {
+        const std::vector<runtime::RuntimeResourceRestoreEntry> entries =
+            g_cache->SnapshotForRestore();
+        const ExclusiveSrwLock writeLock(g_writeLock);
+        for (const runtime::RuntimeResourceRestoreEntry& entry : entries) {
+            ParsedResourcePrefix prefix{};
+            std::vector<core::RuntimePropertyRecord> current;
+            std::string error;
+            const bool identityValid = ReadCurrentProcess(
+                entry.key.resourceAddress, &prefix, sizeof(prefix)) &&
+                core::Tgi{prefix.type, prefix.group, prefix.instance} == entry.key.target;
+            const bool tableValid =
+                identityValid && ReadPropertyTable(prefix, current, error);
+            if (!tableValid || EqualRecords(current, entry.vanilla)) {
+                continue;
+            }
+            if (!EqualRecords(current, entry.lastApplied)) {
+                logging::AsyncLogger::Instance().WriteFormat(
+                    logging::Level::Warning,
+                    "[SC13][PATCH] detach restore skipped changed resource=%p TGI=%s",
+                    reinterpret_cast<void*>(entry.key.resourceAddress),
+                    core::ToString(entry.key.target).c_str());
+                continue;
+            }
+            std::size_t restoredCount = 0U;
+            const bool restored = ApplyValueTransition(
+                prefix, entry.lastApplied, entry.vanilla, restoredCount);
+            logging::AsyncLogger::Instance().WriteFormat(
+                restored ? logging::Level::Info : logging::Level::Warning,
+                "[SC13][PATCH] detach restore resource=%p TGI=%s values=%zu status=%s",
+                reinterpret_cast<void*>(entry.key.resourceAddress),
+                core::ToString(entry.key.target).c_str(), restoredCount,
+                restored ? "restored" : "skipped");
+        }
+    } catch (...) {
+        logging::AsyncLogger::Instance().Write(
+            logging::Level::Error,
+            "[SC13][PATCH] detach restoration failed safely with an exception");
+    }
+    g_cache->Clear();
 }
 
-/** Intercepts PFRecordRead construction and filters its verified second argument as instance/type/group. */
+#if defined(SC13_ENABLE_DISCOVERY_TRACE)
+/** Reports whether a TGI is currently relevant to any active declarative patch. */
+[[nodiscard]] bool HasActivePatch(const core::Tgi& target) noexcept {
+    return g_registry != nullptr && g_registry->Current()->Find(target) != nullptr;
+}
+
+/** Observes construction of reader records for currently active resource identities. */
 void* __fastcall HookPFRecordReadConstructor(
     void* self,
     void*,
@@ -344,116 +432,172 @@ void* __fastcall HookPFRecordReadConstructor(
     void* options) noexcept {
     void* const result =
         g_originalPFRecordReadConstructor(self, ownerContext, keyArgument, options);
-
-    std::array<std::uint32_t, 3> runtimeWords{};
-    std::memcpy(
-        runtimeWords.data(), static_cast<const std::byte*>(self) + 0x0CU,
-        sizeof(runtimeWords));
-    const core::Tgi tgi{runtimeWords[1], runtimeWords[2], runtimeWords[0]};
-    if (kTargetFilter.Matches(tgi)) {
-        logging::AsyncLogger::Instance().WriteFormat(
-            logging::Level::Info,
-            "[SC13][RESOURCE] thread=%lu TGI=%s PFRecordRead=%p owner=%p keyArg=%p "
-            "options=%p runtime-order=instance/type/group",
-            GetCurrentThreadId(), core::ToString(tgi).c_str(), self, ownerContext,
-            keyArgument, options);
-        logging::AsyncLogger::Instance().Write(
-            logging::Level::Info,
-            "Target TGI 00B1B104:61EFC000:719436BD observed at PFRecordRead boundary");
-        LogTargetStack();
+    if (self != nullptr) {
+        std::array<std::uint32_t, 3> words{};
+        if (ReadCurrentProcess(
+                reinterpret_cast<std::uintptr_t>(self) + 0x0CU,
+                words.data(), sizeof(words))) {
+            const core::Tgi target{words[1], words[2], words[0]};
+            if (HasActivePatch(target)) {
+                logging::AsyncLogger::Instance().WriteFormat(
+                    logging::Level::Trace,
+                    "[SC13][RESOURCE] TGI=%s PFRecordRead=%p owner=%p key=%p options=%p",
+                    core::ToString(target).c_str(), self, ownerContext, keyArgument, options);
+            }
+        }
     }
     return result;
 }
 
-/** Observes the complete target property vector immediately before game publication. */
+/** Observes publication of resources currently targeted by active mods. */
 void __cdecl HookPublishParsedResource(
     void* resource,
     void* context,
     std::uint32_t notify) noexcept {
     if (resource != nullptr) {
-        std::array<std::uint32_t, 3> identityWords{};
-        std::memcpy(
-            identityWords.data(), static_cast<const std::byte*>(resource) + 0x08U,
-            sizeof(identityWords));
-        const core::Tgi tgi{identityWords[1], identityWords[2], identityWords[0]};
-        if (kTargetFilter.Matches(tgi)) {
-            ParsedResourcePrefix prefix{};
-            const bool prefixCopied = ReadCurrentProcess(
-                reinterpret_cast<std::uintptr_t>(resource), &prefix, sizeof(prefix));
-            std::array<core::RuntimePropertyRecord, kExpectedPropertyCount> properties{};
-            const bool boundsValid = prefixCopied && prefix.reserved == 0U &&
-                                     prefix.propertyBegin != 0U &&
-                                     prefix.propertyEnd == prefix.propertyCapacity &&
-                                     prefix.propertyEnd >= prefix.propertyBegin &&
-                                     prefix.propertyEnd - prefix.propertyBegin ==
-                                         properties.size() * sizeof(properties.front());
-            const bool copied = boundsValid && ReadCurrentProcess(
-                prefix.propertyBegin, properties.data(), sizeof(properties));
-            const bool tableValid = copied &&
-                core::ValidateRuntimePropertyTable(properties, kExpectedPropertyCount) ==
-                    core::RuntimeTableStatus::Valid;
-            std::array<float, kObservedProperties.size()> values{};
-            bool valuesValid = tableValid;
-            for (std::size_t index = 0; index < kObservedProperties.size() && valuesValid;
-                 ++index) {
-                const auto value =
-                    core::ReadRuntimeFloat(properties, kObservedProperties[index]);
-                valuesValid = value.has_value();
-                if (value.has_value()) {
-                    values[index] = value.value();
-                }
-            }
-            bool baselineValid = valuesValid;
-            for (std::size_t index = 0; index < values.size() && baselineValid; ++index) {
-                baselineValid = values[index] == kExpectedPropertyValues[index];
-            }
-            if (valuesValid) {
+        ParsedResourcePrefix prefix{};
+        if (ReadCurrentProcess(
+                reinterpret_cast<std::uintptr_t>(resource), &prefix, sizeof(prefix))) {
+            const core::Tgi target{prefix.type, prefix.group, prefix.instance};
+            if (HasActivePatch(target)) {
                 logging::AsyncLogger::Instance().WriteFormat(
-                    logging::Level::Info,
-                    "[SC13][RESOURCE] thread=%lu TGI=%s stage=parsed-before-publish "
-                    "mode=observe-only resource=%p context=%p notify=%u records=%zu stride=%zu",
-                    GetCurrentThreadId(), core::ToString(tgi).c_str(), resource, context, notify,
-                    properties.size(), sizeof(properties.front()));
-                for (std::size_t index = 0; index < kObservedProperties.size(); ++index) {
-                    logging::AsyncLogger::Instance().WriteFormat(
-                        logging::Level::Info, "[SC13][PROP] id=0x%08X float=%.3f",
-                        kObservedProperties[index], values[index]);
-                }
-                logging::AsyncLogger::Instance().WriteFormat(
-                    baselineValid ? logging::Level::Info : logging::Level::Error,
-                    "[SC13][RESOURCE] runtime PROP baseline=%s expected=300/72/2/200; "
-                    "mode=observe-only fail-open",
-                    baselineValid ? "verified" : "mismatch");
-                LogTargetStack();
-            } else {
-                logging::AsyncLogger::Instance().WriteFormat(
-                    logging::Level::Error,
-                    "[SC13][RESOURCE] target refused at parsed-before-publish: "
-                    "resource=%p bounds=%s copied=%s table=%s values=%s; fail-open",
-                    resource, boundsValid ? "valid" : "invalid", copied ? "yes" : "no",
-                    tableValid ? "valid" : "invalid", valuesValid ? "valid" : "invalid");
+                    logging::Level::Trace,
+                    "[SC13][RESOURCE] TGI=%s publish resource=%p context=%p notify=%u",
+                    core::ToString(target).c_str(), resource, context, notify);
             }
         }
     }
     g_originalPublishParsedResource(resource, context, notify);
 }
+#endif
 
 }  // namespace
 
+void ConfigureResourceRuntime(
+    mods::PatchRegistry& registry,
+    runtime::RuntimeResourceCache& cache) noexcept {
+    g_registry = &registry;
+    g_cache = &cache;
+}
+
+bool RefreshRuntimeResources(
+    const std::set<core::Tgi>& affected,
+    std::string& error) noexcept {
+    try {
+        error.clear();
+        if (g_registry == nullptr || g_cache == nullptr) {
+            error = "Runtime patch services are not configured";
+            return false;
+        }
+        if (affected.empty()) {
+            return true;
+        }
+
+        const std::shared_ptr<const mods::PatchRegistrySnapshot> snapshot =
+            g_registry->Current();
+        const std::vector<runtime::RuntimeResourceRestoreEntry> entries =
+            g_cache->SnapshotForRestore();
+        std::size_t refreshedResources = 0U;
+        std::size_t changedValues = 0U;
+        std::size_t staleResources = 0U;
+        std::size_t failedResources = 0U;
+        for (const runtime::RuntimeResourceRestoreEntry& entry : entries) {
+            if (!affected.contains(entry.key.target)) {
+                continue;
+            }
+            ParsedResourcePrefix prefix{};
+            const bool identityValid = ReadCurrentProcess(
+                entry.key.resourceAddress, &prefix, sizeof(prefix)) &&
+                core::Tgi{prefix.type, prefix.group, prefix.instance} == entry.key.target;
+            std::vector<core::RuntimePropertyRecord> current;
+            std::string resourceError;
+            if (!identityValid || !ReadPropertyTable(prefix, current, resourceError)) {
+                ++staleResources;
+                continue;
+            }
+
+            const std::vector<mods::RegisteredPatch>* const registered =
+                snapshot->Find(entry.key.target);
+            const std::span<const mods::RegisteredPatch> patches =
+                registered == nullptr ? std::span<const mods::RegisteredPatch>{}
+                                      : std::span<const mods::RegisteredPatch>(*registered);
+            runtime::RuntimeResourceBuildPlan plan;
+            if (!g_cache->Prepare(
+                    entry.key, current, snapshot->generation(), patches,
+                    plan, resourceError)) {
+                ++failedResources;
+                logging::AsyncLogger::Instance().WriteFormat(
+                    logging::Level::Warning,
+                    "[SC13][PATCH] live refresh prepare rejected resource=%p TGI=%s: %s",
+                    reinterpret_cast<void*>(entry.key.resourceAddress),
+                    core::ToString(entry.key.target).c_str(), resourceError.c_str());
+                continue;
+            }
+            std::size_t resourceChangedValues = 0U;
+            if (!ApplyAndCommitPlan(
+                    prefix, plan, resourceChangedValues, resourceError)) {
+                ++failedResources;
+                logging::AsyncLogger::Instance().WriteFormat(
+                    logging::Level::Warning,
+                    "[SC13][PATCH] live refresh write rejected resource=%p TGI=%s: %s",
+                    reinterpret_cast<void*>(entry.key.resourceAddress),
+                    core::ToString(entry.key.target).c_str(), resourceError.c_str());
+                continue;
+            }
+            ++refreshedResources;
+            changedValues += resourceChangedValues;
+            logging::AsyncLogger::Instance().WriteFormat(
+                logging::Level::Patch,
+                "[SC13][PATCH] live refresh resource=%p TGI=%s generation=%llu "
+                "patchOwners=%zu changedValues=%zu cache=%s",
+                reinterpret_cast<void*>(entry.key.resourceAddress),
+                core::ToString(entry.key.target).c_str(),
+                static_cast<unsigned long long>(snapshot->generation()), patches.size(),
+                resourceChangedValues,
+                runtime::RuntimeResourceBuildStatusName(plan.status));
+        }
+        logging::AsyncLogger::Instance().WriteFormat(
+            failedResources == 0U ? logging::Level::Info : logging::Level::Warning,
+            "[SC13][PATCH] live refresh summary generation=%llu affected=%zu "
+            "refreshed=%zu stale=%zu failed=%zu changedValues=%zu",
+            static_cast<unsigned long long>(snapshot->generation()), affected.size(),
+            refreshedResources, staleResources, failedResources, changedValues);
+        if (changedValues != 0U && !runtime::SignalPatchApplied()) {
+            logging::AsyncLogger::Instance().Write(
+                logging::Level::Warning,
+                "[SC13][PATCH] Live refresh succeeded but patch-applied signal failed");
+        }
+        if (failedResources != 0U) {
+            error = std::to_string(failedResources) +
+                " retained live resource(s) could not be rebuilt";
+            return false;
+        }
+        return true;
+    } catch (...) {
+        error = "Live resource refresh failed safely with an exception";
+        return false;
+    }
+}
+
 bool CreateResourceTraceHook(
-    const reverse::BuildFingerprint& fingerprint, std::string& error) noexcept {
+    const reverse::BuildFingerprint& fingerprint,
+    std::string& error) noexcept {
+    if (g_registry == nullptr || g_cache == nullptr) {
+        error = "Resource runtime services were not configured";
+        return false;
+    }
 #if defined(SC13_ENABLE_DISCOVERY_TRACE)
     reverse::ResourceSymbols symbols{};
     if (!reverse::ResolveResourceSymbols(fingerprint, symbols, error)) {
         return false;
     }
-    const MH_STATUS status = MH_CreateHook(
+    const MH_STATUS readerStatus = MH_CreateHook(
         symbols.pfRecordReadConstructor,
         reinterpret_cast<LPVOID>(&HookPFRecordReadConstructor),
         reinterpret_cast<LPVOID*>(&g_originalPFRecordReadConstructor));
-    if (status != MH_OK) {
+    if (readerStatus != MH_OK) {
         error = std::string("MH_CreateHook failed for PFRecordRead: ") +
-                MH_StatusToString(status);
+                MH_StatusToString(readerStatus);
         return false;
     }
     const MH_STATUS publishStatus = MH_CreateHook(
@@ -484,16 +628,6 @@ bool CreateResourceTraceHook(
                 MH_StatusToString(deserializeStatus);
         return false;
     }
-#if defined(SC13_ENABLE_DISCOVERY_TRACE)
-    logging::AsyncLogger::Instance().WriteFormat(
-        logging::Level::Info,
-        "Resolved PFRecordRead constructor uniquely: module=SimCity.exe RVA=0x%08X address=%p",
-        symbols.pfRecordReadConstructorRva, symbols.pfRecordReadConstructor);
-    logging::AsyncLogger::Instance().WriteFormat(
-        logging::Level::Info,
-        "Resolved parsed-resource publisher uniquely: module=SimCity.exe RVA=0x%08X address=%p",
-        symbols.publishParsedResourceRva, symbols.publishParsedResource);
-#endif
     logging::AsyncLogger::Instance().WriteFormat(
         logging::Level::Info,
         "Resolved PROP deserializer uniquely: module=SimCity.exe RVA=0x%08X address=%p",
@@ -506,10 +640,12 @@ bool CreateResourceTraceHook(
 }
 
 void ResetResourceTrace() noexcept {
-    RestoreRuntimePatches();
+    RestoreRuntimeResources();
     g_originalPFRecordReadConstructor = nullptr;
     g_originalPublishParsedResource = nullptr;
     g_originalPropDeserialize = nullptr;
+    g_registry = nullptr;
+    g_cache = nullptr;
 }
 
 }  // namespace sc13::hooks

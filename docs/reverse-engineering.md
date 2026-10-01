@@ -4,12 +4,33 @@ Facts in this document are scoped to the local installation inspected on 2026-08
 2026-08-17. Every item is labeled by confidence. Addresses are valid only for the exact hashes
 recorded below.
 
+## M3 precondition matrix
+
+| Required M2 primitive | Status | Evidence |
+| --- | --- | --- |
+| runtime DLL loading works | DONE | watcher/injector and `SC13_Initialize` runtime records |
+| safe attach works | DONE | repeated EA-launched process attach tests |
+| safe detach works | DONE | controlled shutdown/unload while the game remained responsive |
+| game build fingerprinting works | DONE | exact file and loaded-text hashes below |
+| runtime resource interception works | DONE | concrete PROP deserializer at RVA `0x00009710` |
+| known TGI can be observed | DONE | Sanitizer TGI runtime records |
+| known Sanitizer PROP can be read | DONE | valid 89-record table and property reads |
+| Maintenance 300 can be patched to 345 in RAM | DONE | atomic runtime write and signal |
+| patched resource reaches the game | DONE | selector and simulation both charged `545 $/h` |
+| Sanitizer remains functional | DONE | placement, operation, modules, bulldoze, save/reload |
+| UI remains functional | DONE | selector and building interactions survived the M2 patch |
+| no package files are modified/generated | DONE | before/after canonical package hash |
+
+These proven prerequisites allowed M3 to replace the hardcoded scalar with a typed mod definition,
+immutable registry snapshot, and vanilla-derived cache. The new Simoder overlay and runtime ON/OFF
+flow still require the manual procedure in `first-test.md`; they are not inferred from M2 evidence.
+
 ## M1/M2 status matrix
 
 | Item | Status | Evidence |
 | --- | --- | --- |
 | DLL attached to SimCity | DONE | `src/bootstrap/launcher_main.cpp`; runtime initialization and unload records in the ignored `logs/sc13modloader.log` |
-| safe detach | DONE | `SC13_Shutdown`, `UninstallTraceHooks`, and `RestoreRuntimePatches`; PID 30180 logged `rollback ... status=restored-300` followed by clean shutdown on 2026-08-17 |
+| safe detach | DONE | `SC13_Shutdown`, `UninstallTraceHooks`, and the historical M2 restore path; PID 30180 logged `rollback ... status=restored-300` followed by clean shutdown on 2026-08-17 |
 | game architecture identified | DONE | PE machine `0x014C` and x86-only CMake gate in `src/reverse/game_build.cpp` and `CMakeLists.txt` |
 | game build fingerprinting | DONE | file/version/loaded-`.text` fingerprinting in `src/reverse/game_build.cpp` |
 | module enumeration | DONE | bounded Toolhelp inventory in `src/reverse/game_build.cpp` and bootstrap logs |
@@ -40,6 +61,9 @@ in `first-test.md` and is not inferred from this implementation matrix.
 - **Verified:** Windows reports the executable's Electronic Arts Authenticode signature as valid.
 - **Verified:** the static dependency table exposed by `dumpbin /dependents` contains only
   `Core/Activation.dll`.
+- **Verified for M3 logging inventory:** the executable imports `OutputDebugStringA`. Simoder
+  captures this preserving Win32 channel. No equivalent evidence establishes stdout/stderr as an
+  active game log channel, so generic C-runtime formatting functions are not intercepted.
 - **Verified:** the PE debug directory names `SimCity.pdb`, GUID
   `{3515CCCA-2EB7-40FB-81BA-B29660519882}`, age 1. The exact symbol-server key returned HTTP 404
   from Microsoft's public symbol server on 2026-08-16, so no matching public PDB is available
@@ -308,12 +332,14 @@ operation wrote, renamed, or deleted it. It is not used as vanilla evidence.
   lossless serializer. SC13 instead preserves the original buffer and records validated spans.
 - OpenSC5 is a reference, not proof of the current game's internal resource-manager ABI.
 
-## Unknowns beyond M2
+## Unknowns beyond M3
 
-- whether the earlier deserializer patch eliminates the stale already-placed-building panel;
-- the generalized ownership and synchronization contract needed for arbitrary resources;
+- safe recreation/refresh contracts for every already-instantiated game object and UI cache;
 - stable signatures and ABI records for builds other than the exact verified executable;
-- the final declarative patch registry and multi-mod conflict policy.
+- typed runtime representations beyond the verified scalar float PROP record;
+- a safe higher-level internal game logger beyond the confirmed OutputDebugString channel;
+- native SimCity UI integration to replace the temporary D3D9 ImGui overlay;
+- explicit user-edited load order, dependencies, and version constraints.
 
 ## Function record template
 

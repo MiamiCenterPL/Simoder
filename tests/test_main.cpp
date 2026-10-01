@@ -1,3 +1,4 @@
+#include "config/loader_config.hpp"
 #include "core/tgi.hpp"
 #include "core/patched_resource_cache.hpp"
 #include "core/resource_filter.hpp"
@@ -5,11 +6,19 @@
 #include "formats/dbpf/dbpf_reader.hpp"
 #include "formats/dbpf/refpack.hpp"
 #include "formats/prop/prop_document.hpp"
+#include "formats/toon/toon_document.hpp"
 #include "memory/signature.hpp"
+#include "logging/log_event.hpp"
+#include "mods/mod_definition_parser.hpp"
+#include "mods/mod_manager.hpp"
+#include "mods/mod_state_store.hpp"
+#include "mods/patch_registry.hpp"
 #include "reverse/pe_file.hpp"
+#include "runtime/runtime_resource_cache.hpp"
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -17,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -290,6 +300,540 @@ void TestProp() {
     }
 }
 
+/** Validates the strict TOON subset used by M3 manifests, config, and overrides. */
+void TestToon() {
+    constexpr std::string_view source =
+        "id: dawid.better-sanitizer\n"
+        "name: Better Sanitizer\n"
+        "version: 1.0.0\n"
+        "developerConsole:\n"
+        "  enabled: false\n"
+        "patches[1]:\n"
+        "  - target:\n"
+        "      type: 0x00B1B104\n"
+        "      group: 0x61EFC000\n"
+        "      instance: 0x719436BD\n"
+        "    properties[1]{id,type,operation,value}:\n"
+        "      0x09AE19D7,float,set,345\n";
+    sc13::formats::toon::Document document;
+    sc13::formats::toon::ParseError error;
+    SC13_EXPECT(sc13::formats::toon::Parse(source, document, error));
+    const auto id = document.root().find("id");
+    SC13_EXPECT(id != document.root().end());
+    SC13_EXPECT(id->second.AsString() != nullptr);
+    SC13_EXPECT(*id->second.AsString() == "dawid.better-sanitizer");
+
+    const auto developerConsole = document.root().find("developerConsole");
+    SC13_EXPECT(developerConsole != document.root().end());
+    const auto* enabled = developerConsole->second.Find("enabled");
+    SC13_EXPECT(enabled != nullptr);
+    SC13_EXPECT(enabled->AsBoolean() != nullptr);
+    SC13_EXPECT(!*enabled->AsBoolean());
+
+    const auto patches = document.root().find("patches");
+    SC13_EXPECT(patches != document.root().end());
+    SC13_EXPECT(patches->second.AsArray() != nullptr);
+    SC13_EXPECT(patches->second.AsArray()->size() == 1U);
+    const auto* target = patches->second.AsArray()->front().Find("target");
+    SC13_EXPECT(target != nullptr);
+    const auto* type = target->Find("type");
+    SC13_EXPECT(type != nullptr);
+    SC13_EXPECT(type->AsString() != nullptr);
+    SC13_EXPECT(*type->AsString() == "0x00B1B104");
+    const auto* properties = patches->second.AsArray()->front().Find("properties");
+    SC13_EXPECT(properties != nullptr);
+    SC13_EXPECT(properties->AsArray() != nullptr);
+    SC13_EXPECT(properties->AsArray()->front().Find("value")->AsNumber() != nullptr);
+    SC13_EXPECT(*properties->AsArray()->front().Find("value")->AsNumber() == 345.0);
+
+    SC13_EXPECT(!sc13::formats::toon::Parse(
+        "items[2]: one\n", document, error));
+    SC13_EXPECT(error.line == 1U);
+    SC13_EXPECT(!sc13::formats::toon::Parse(
+        "root:\n   child: bad-indent\n", document, error));
+    SC13_EXPECT(error.line == 2U);
+    SC13_EXPECT(!sc13::formats::toon::Parse(
+        "key: one\nkey: two\n", document, error));
+    SC13_EXPECT(error.line == 2U);
+}
+
+/** Creates an empty uniquely named temporary directory for filesystem tests. */
+[[nodiscard]] std::filesystem::path CreateTemporaryDirectory() {
+    wchar_t temporaryDirectory[MAX_PATH]{};
+    wchar_t temporaryName[MAX_PATH]{};
+    SC13_EXPECT(GetTempPathW(MAX_PATH, temporaryDirectory) != 0);
+    SC13_EXPECT(GetTempFileNameW(temporaryDirectory, L"s13", 0, temporaryName) != 0);
+    SC13_EXPECT(DeleteFileW(temporaryName) != FALSE);
+    SC13_EXPECT(CreateDirectoryW(temporaryName, nullptr) != FALSE);
+    return temporaryName;
+}
+
+/** Writes one complete UTF-8 fixture file. */
+void WriteTextFile(const std::filesystem::path& path, std::string_view text) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    SC13_EXPECT(static_cast<bool>(stream));
+}
+
+/** Writes one complete valid mod fixture with a configurable float set operation. */
+void WriteModFixture(
+    const std::filesystem::path& directory,
+    std::string_view id,
+    std::string_view name,
+    float value) {
+    std::error_code directoryError;
+    std::filesystem::create_directories(directory, directoryError);
+    SC13_EXPECT(!directoryError);
+    WriteTextFile(
+        directory / L"mod.toon",
+        "id: " + std::string(id) + "\n" +
+        "name: " + std::string(name) + "\n" +
+        "version: 1.0.0\n" +
+        "author: Simoder Tests\n");
+    WriteTextFile(
+        directory / L"overrides.toon",
+        "patches[1]:\n"
+        "  - target:\n"
+        "      type: 0x00B1B104\n"
+        "      group: 0x61EFC000\n"
+        "      instance: 0x719436BD\n"
+        "    properties[1]{id,type,operation,value}:\n"
+        "      0x09AE19D7,float,set," + std::to_string(value) + "\n");
+}
+
+/** Validates typed manifest and override conversion plus unsafe-input rejection. */
+void TestModDefinitionParser() {
+    const std::filesystem::path directory = CreateTemporaryDirectory();
+    WriteTextFile(
+        directory / L"mod.toon",
+        "id: dawid.better-sanitizer\n"
+        "name: Better Sanitizer\n"
+        "version: 1.0.0\n"
+        "author: Dawid\n");
+    WriteTextFile(
+        directory / L"overrides.toon",
+        "patches[1]:\n"
+        "  - target:\n"
+        "      type: 0x00B1B104\n"
+        "      group: 0x61EFC000\n"
+        "      instance: 0x719436BD\n"
+        "    properties[1]{id,type,operation,value}:\n"
+        "      0x09AE19D7,float,set,345\n");
+
+    sc13::mods::ModDefinition definition;
+    std::string error;
+    SC13_EXPECT(sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(definition.manifest.id == "dawid.better-sanitizer");
+    SC13_EXPECT(definition.manifest.name == "Better Sanitizer");
+    SC13_EXPECT(definition.patches.size() == 1U);
+    const sc13::core::Tgi expectedTarget{
+        0x00B1B104U, 0x61EFC000U, 0x719436BDU};
+    SC13_EXPECT(definition.patches.front().target == expectedTarget);
+    SC13_EXPECT(definition.patches.front().properties.size() == 1U);
+    SC13_EXPECT(
+        definition.patches.front().properties.front().operation ==
+        sc13::mods::PatchOperation::Set);
+    SC13_EXPECT(definition.patches.front().properties.front().value == 345.0F);
+
+    WriteTextFile(
+        directory / L"mod.toon",
+        "id: Invalid.Id\nname: Invalid\nversion: 1.0.0\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("valid stable mod identity") != std::string::npos);
+
+    WriteTextFile(
+        directory / L"mod.toon",
+        "id: dawid.valid\nname: Valid\nversion: 1.0.0\n");
+    WriteTextFile(
+        directory / L"overrides.toon",
+        "patches[1]:\n"
+        "  - target:\n"
+        "      type: 0x00B1B104\n"
+        "      group: 0x61EFC000\n"
+        "      instance: 0x719436BD\n"
+        "    properties[1]{id,type,operation,value}:\n"
+        "      0x09AE19D7,float,divide,0\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("cannot use zero") != std::string::npos);
+    std::error_code removeError;
+    std::filesystem::remove_all(directory, removeError);
+    SC13_EXPECT(!removeError);
+}
+
+/** Creates one typed float patch block for registry tests. */
+[[nodiscard]] sc13::mods::ResourcePatchDefinition MakeResourcePatch(
+    const sc13::core::Tgi& target,
+    std::uint32_t propertyId,
+    sc13::mods::PatchOperation operation,
+    float value) {
+    return sc13::mods::ResourcePatchDefinition{
+        target,
+        {sc13::mods::PropertyPatch{
+            propertyId, sc13::mods::PropertyType::Float, operation, value}}};
+}
+
+/** Validates ownership, activation order, conflicts, and vanilla-derived application. */
+void TestPatchRegistry() {
+    constexpr std::uint32_t floatMetadata = 0x000D0000U;
+    const sc13::core::Tgi target{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
+    const auto setMaintenance = MakeResourcePatch(
+        target, 0x09AE19D7U, sc13::mods::PatchOperation::Set, 345.0F);
+    const auto addMaintenance = MakeResourcePatch(
+        target, 0x09AE19D7U, sc13::mods::PatchOperation::Add, 5.0F);
+    const auto multiplyCapacity = MakeResourcePatch(
+        target, 0x0AFB9882U, sc13::mods::PatchOperation::Multiply, 2.0F);
+
+    sc13::mods::PatchRegistry registry;
+    std::set<sc13::core::Tgi> affected;
+    std::string error;
+    SC13_EXPECT(registry.Current()->generation() == 0U);
+    SC13_EXPECT(registry.Activate(
+        "mod.set", std::span(&setMaintenance, 1U), affected, error));
+    SC13_EXPECT(affected == std::set<sc13::core::Tgi>{target});
+    const std::shared_ptr<const sc13::mods::PatchRegistrySnapshot> first =
+        registry.Current();
+    SC13_EXPECT(first->generation() == 1U);
+    SC13_EXPECT(first->Find(target) != nullptr);
+    SC13_EXPECT(first->Find(target)->front().owner == "mod.set");
+
+    SC13_EXPECT(registry.Activate(
+        "mod.add", std::span(&addMaintenance, 1U), affected, error));
+    const auto second = registry.Current();
+    SC13_EXPECT(second->generation() == 2U);
+    SC13_EXPECT(second->Find(target)->size() == 2U);
+    SC13_EXPECT((*second->Find(target))[0].owner == "mod.set");
+    SC13_EXPECT((*second->Find(target))[1].owner == "mod.add");
+    SC13_EXPECT(second->conflicts().size() == 1U);
+    SC13_EXPECT(second->conflicts().front().propertyId == 0x09AE19D7U);
+    SC13_EXPECT(first->Find(target)->size() == 1U);
+
+    std::array<sc13::core::RuntimePropertyRecord, 2> vanilla{
+        sc13::core::RuntimePropertyRecord{
+            0x09AE19D7U, std::bit_cast<std::uint32_t>(300.0F), {}, floatMetadata},
+        sc13::core::RuntimePropertyRecord{
+            0x0AFB9882U, std::bit_cast<std::uint32_t>(72.0F), {}, floatMetadata}};
+    std::vector<sc13::core::RuntimePropertyRecord> rebuilt;
+    SC13_EXPECT(sc13::mods::ApplyPatchSequence(
+        target, vanilla, *second->Find(target), rebuilt, error));
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(rebuilt, 0x09AE19D7U).value() == 350.0F);
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(vanilla, 0x09AE19D7U).value() == 300.0F);
+
+    const auto generationBeforeFailure = second->generation();
+    SC13_EXPECT(!registry.Activate(
+        "mod.set", std::span(&setMaintenance, 1U), affected, error));
+    SC13_EXPECT(registry.Current()->generation() == generationBeforeFailure);
+    SC13_EXPECT(registry.Deactivate("mod.add", affected, error));
+    SC13_EXPECT(registry.Current()->Find(target)->size() == 1U);
+
+    sc13::mods::PatchRegistry nonConflicting;
+    SC13_EXPECT(nonConflicting.Activate(
+        "mod.maintenance", std::span(&setMaintenance, 1U), affected, error));
+    SC13_EXPECT(nonConflicting.Activate(
+        "mod.capacity", std::span(&multiplyCapacity, 1U), affected, error));
+    SC13_EXPECT(nonConflicting.Current()->conflicts().empty());
+    SC13_EXPECT(sc13::mods::ApplyPatchSequence(
+        target, vanilla, *nonConflicting.Current()->Find(target), rebuilt, error));
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(rebuilt, 0x09AE19D7U).value() == 345.0F);
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(rebuilt, 0x0AFB9882U).value() == 144.0F);
+}
+
+/** Validates generation retention, targeted invalidation, and vanilla restoration. */
+void TestRuntimeResourceCache() {
+    constexpr std::uint32_t floatMetadata = 0x000D0000U;
+    const sc13::core::Tgi targetA{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
+    const sc13::core::Tgi targetB{0x00B1B104U, 0x61EFC000U, 0x11111111U};
+    const auto setMaintenance = MakeResourcePatch(
+        targetA, 0x09AE19D7U, sc13::mods::PatchOperation::Set, 345.0F);
+    sc13::mods::PatchRegistry registry;
+    std::set<sc13::core::Tgi> affected;
+    std::string error;
+    SC13_EXPECT(registry.Activate(
+        "mod.cache", std::span(&setMaintenance, 1U), affected, error));
+    const auto snapshot = registry.Current();
+
+    std::array<sc13::core::RuntimePropertyRecord, 1> vanillaA{
+        sc13::core::RuntimePropertyRecord{
+            0x09AE19D7U, std::bit_cast<std::uint32_t>(300.0F), {}, floatMetadata}};
+    std::array<sc13::core::RuntimePropertyRecord, 1> vanillaB{
+        sc13::core::RuntimePropertyRecord{
+            0x09AE19D7U, std::bit_cast<std::uint32_t>(100.0F), {}, floatMetadata}};
+    sc13::runtime::RuntimeResourceCache cache;
+    sc13::runtime::RuntimeResourceBuildPlan planA;
+    const sc13::runtime::RuntimeResourceKey keyA{targetA, 0x1000U};
+    SC13_EXPECT(cache.Prepare(
+        keyA, vanillaA, snapshot->generation(), *snapshot->Find(targetA), planA, error));
+    SC13_EXPECT(
+        planA.status == sc13::runtime::RuntimeResourceBuildStatus::Created);
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(planA.desired, 0x09AE19D7U).value() == 345.0F);
+    SC13_EXPECT(sc13::core::ReadRuntimeFloat(vanillaA, 0x09AE19D7U).value() == 300.0F);
+    SC13_EXPECT(cache.Commit(planA, error));
+
+    sc13::runtime::RuntimeResourceBuildPlan stalePlan;
+    SC13_EXPECT(cache.Prepare(
+        keyA, planA.desired, snapshot->generation(),
+        *snapshot->Find(targetA), stalePlan, error));
+    SC13_EXPECT(cache.Invalidate(std::set<sc13::core::Tgi>{targetA}) == 1U);
+    SC13_EXPECT(!cache.Commit(stalePlan, error));
+
+    sc13::runtime::RuntimeResourceBuildPlan planB;
+    const sc13::runtime::RuntimeResourceKey keyB{targetB, 0x2000U};
+    SC13_EXPECT(cache.Prepare(
+        keyB, vanillaB, snapshot->generation(), {}, planB, error));
+    SC13_EXPECT(cache.Commit(planB, error));
+    SC13_EXPECT(cache.size() == 2U);
+    SC13_EXPECT(cache.Invalidate(std::set<sc13::core::Tgi>{targetA}) == 0U);
+
+    sc13::runtime::RuntimeResourceBuildPlan reusedB;
+    SC13_EXPECT(cache.Prepare(
+        keyB, planB.desired, snapshot->generation() + 1U, {}, reusedB, error));
+    SC13_EXPECT(
+        reusedB.status == sc13::runtime::RuntimeResourceBuildStatus::Reused);
+
+    SC13_EXPECT(registry.Deactivate("mod.cache", affected, error));
+    sc13::runtime::RuntimeResourceBuildPlan restoredA;
+    SC13_EXPECT(cache.Prepare(
+        keyA, planA.desired, registry.Current()->generation(), {}, restoredA, error));
+    SC13_EXPECT(
+        restoredA.status == sc13::runtime::RuntimeResourceBuildStatus::Restored);
+    SC13_EXPECT(
+        sc13::core::ReadRuntimeFloat(restoredA.desired, 0x09AE19D7U).value() == 300.0F);
+    SC13_EXPECT(cache.Commit(restoredA, error));
+    const auto restoreEntries = cache.SnapshotForRestore();
+    SC13_EXPECT(restoreEntries.size() == 2U);
+    SC13_EXPECT(std::any_of(
+        restoreEntries.begin(), restoreEntries.end(),
+        [&keyA](const sc13::runtime::RuntimeResourceRestoreEntry& entry) {
+            return entry.key == keyA && entry.vanilla.size() == 1U &&
+                   entry.lastApplied.size() == 1U;
+        }));
+}
+
+/** Validates generated defaults and typed DeveloperConsole configuration parsing. */
+void TestLoaderConfig() {
+    const std::filesystem::path directory = CreateTemporaryDirectory();
+    sc13::config::LoaderConfig config;
+    std::string error;
+    SC13_EXPECT(sc13::config::LoadOrCreateConfig(directory, config, error));
+    SC13_EXPECT(!config.developerConsole.enabled);
+    SC13_EXPECT(config.developerConsole.captureGameLogs);
+    SC13_EXPECT(std::filesystem::is_regular_file(directory / L"config.toon"));
+
+    WriteTextFile(
+        directory / L"config.toon",
+        "developerConsole:\n"
+        "  enabled: true\n"
+        "  captureGameLogs: false\n"
+        "  captureLoaderLogs: true\n"
+        "  captureModLogs: true\n"
+        "  level: debug\n");
+    SC13_EXPECT(sc13::config::LoadOrCreateConfig(directory, config, error));
+    SC13_EXPECT(config.developerConsole.enabled);
+    SC13_EXPECT(!config.developerConsole.captureGameLogs);
+    SC13_EXPECT(config.developerConsole.level == "debug");
+
+    WriteTextFile(
+        directory / L"config.toon",
+        "developerConsole:\n"
+        "  enabled: yes\n");
+    SC13_EXPECT(!sc13::config::LoadOrCreateConfig(directory, config, error));
+    SC13_EXPECT(!config.developerConsole.enabled);
+    std::error_code removeError;
+    std::filesystem::remove_all(directory, removeError);
+    SC13_EXPECT(!removeError);
+}
+
+/** Validates centralized semantic source labels and severity filtering. */
+void TestLogEventClassification() {
+    SC13_EXPECT(std::string_view(sc13::logging::SourceTypeName(
+                    sc13::logging::SourceType::Game)) == "GAME");
+    SC13_EXPECT(std::string_view(sc13::logging::SourceTypeName(
+                    sc13::logging::SourceType::Loader)) == "LOADER");
+    SC13_EXPECT(std::string_view(sc13::logging::SourceTypeName(
+                    sc13::logging::SourceType::Mod)) == "MOD");
+    sc13::logging::Level level = sc13::logging::Level::Error;
+    SC13_EXPECT(sc13::logging::ParseLevel("debug", level));
+    SC13_EXPECT(level == sc13::logging::Level::Debug);
+    SC13_EXPECT(sc13::logging::PassesMinimum(
+        sc13::logging::Level::Warning, sc13::logging::Level::Info));
+    SC13_EXPECT(!sc13::logging::PassesMinimum(
+        sc13::logging::Level::Trace, sc13::logging::Level::Info));
+    SC13_EXPECT(!sc13::logging::ParseLevel("verbose", level));
+}
+
+/** Validates atomic enabled-state persistence, ordering, and strict validation. */
+void TestModStateStore() {
+    const std::filesystem::path directory = CreateTemporaryDirectory();
+    const std::filesystem::path statePath = directory / L"state.toon";
+    std::vector<sc13::mods::ModId> enabled;
+    std::string error;
+    SC13_EXPECT(sc13::mods::LoadEnabledState(statePath, enabled, error));
+    SC13_EXPECT(enabled.empty());
+
+    const std::array<sc13::mods::ModId, 2> expected{
+        "example.first", "example.second"};
+    SC13_EXPECT(sc13::mods::SaveEnabledState(statePath, expected, error));
+    SC13_EXPECT(!std::filesystem::exists(directory / L"state.toon.tmp"));
+    SC13_EXPECT(sc13::mods::LoadEnabledState(statePath, enabled, error));
+    SC13_EXPECT(enabled.size() == expected.size());
+    SC13_EXPECT(enabled[0] == expected[0]);
+    SC13_EXPECT(enabled[1] == expected[1]);
+
+    WriteTextFile(statePath, "enabled[2]: duplicate.id,duplicate.id\n");
+    SC13_EXPECT(!sc13::mods::LoadEnabledState(statePath, enabled, error));
+    SC13_EXPECT(enabled.empty());
+
+    const std::array<sc13::mods::ModId, 2> invalid{
+        "valid.id", "Invalid ID"};
+    SC13_EXPECT(!sc13::mods::SaveEnabledState(statePath, invalid, error));
+    std::error_code removeError;
+    std::filesystem::remove_all(directory, removeError);
+    SC13_EXPECT(!removeError);
+}
+
+/** Validates discovery, persistence, changed files, removal, and failure isolation. */
+void TestModManager() {
+    const std::filesystem::path root = CreateTemporaryDirectory();
+    const std::filesystem::path modsDirectory = root / L"mods";
+    const std::filesystem::path statePath = root / L"simoder" / L"state.toon";
+    const std::filesystem::path sanitizer = modsDirectory / L"BetterSanitizer";
+    WriteModFixture(
+        sanitizer, "dawid.better-sanitizer", "Better Sanitizer", 345.0F);
+
+    sc13::mods::PatchRegistry registry;
+    sc13::runtime::RuntimeResourceCache cache;
+    std::size_t runtimeRefreshCount = 0U;
+    std::set<sc13::core::Tgi> lastRuntimeRefresh;
+    sc13::mods::ModManager manager(
+        modsDirectory, statePath, registry, cache,
+        [&runtimeRefreshCount, &lastRuntimeRefresh](
+            const std::set<sc13::core::Tgi>& affected,
+            std::string& refreshError) {
+            ++runtimeRefreshCount;
+            lastRuntimeRefresh = affected;
+            refreshError.clear();
+            return true;
+        });
+    std::string error;
+    SC13_EXPECT(manager.Initialize(error));
+    auto entries = manager.Snapshot();
+    SC13_EXPECT(entries.size() == 1U);
+    SC13_EXPECT(entries.front().state == sc13::mods::ModState::Inactive);
+    SC13_EXPECT(entries.front().canEnable);
+
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", true, error));
+    SC13_EXPECT(registry.IsActive("dawid.better-sanitizer"));
+    SC13_EXPECT(manager.EnabledOrder().size() == 1U);
+    const sc13::core::Tgi target{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
+    SC13_EXPECT(runtimeRefreshCount == 1U);
+    SC13_EXPECT(lastRuntimeRefresh.contains(target));
+    SC13_EXPECT(
+        registry.Current()->Find(target)->front().patch.properties.front().value ==
+        345.0F);
+
+    {
+        sc13::mods::PatchRegistry restartedRegistry;
+        sc13::runtime::RuntimeResourceCache restartedCache;
+        sc13::mods::ModManager restarted(
+            modsDirectory, statePath, restartedRegistry, restartedCache);
+        SC13_EXPECT(restarted.Initialize(error));
+        SC13_EXPECT(restartedRegistry.IsActive("dawid.better-sanitizer"));
+        SC13_EXPECT(restarted.EnabledOrder().size() == 1U);
+    }
+
+    WriteModFixture(
+        sanitizer, "dawid.better-sanitizer", "Better Sanitizer", 360.0F);
+    SC13_EXPECT(manager.Refresh(error));
+    entries = manager.Snapshot();
+    SC13_EXPECT(entries.front().state == sc13::mods::ModState::Changed);
+    SC13_EXPECT(entries.front().changed);
+    SC13_EXPECT(
+        registry.Current()->Find(target)->front().patch.properties.front().value ==
+        345.0F);
+
+    WriteTextFile(sanitizer / L"overrides.toon", "patches: malformed\n");
+    SC13_EXPECT(manager.Refresh(error));
+    entries = manager.Snapshot();
+    SC13_EXPECT(entries.front().state == sc13::mods::ModState::Changed);
+    SC13_EXPECT(registry.IsActive("dawid.better-sanitizer"));
+    SC13_EXPECT(
+        registry.Current()->Find(target)->front().patch.properties.front().value ==
+        345.0F);
+
+    WriteModFixture(
+        sanitizer, "dawid.better-sanitizer", "Better Sanitizer", 360.0F);
+    SC13_EXPECT(manager.Refresh(error));
+
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", false, error));
+    SC13_EXPECT(!registry.IsActive("dawid.better-sanitizer"));
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", true, error));
+    SC13_EXPECT(
+        registry.Current()->Find(target)->front().patch.properties.front().value ==
+        360.0F);
+
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", false, error));
+    WriteModFixture(
+        sanitizer, "dawid.better-sanitizer", "Better Sanitizer", 400.0F);
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", true, error));
+    SC13_EXPECT(runtimeRefreshCount == 5U);
+    SC13_EXPECT(
+        registry.Current()->Find(target)->front().patch.properties.front().value ==
+        400.0F);
+
+    WriteTextFile(sanitizer / L"overrides.toon", "patches: malformed\n");
+    SC13_EXPECT(manager.Refresh(error));
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", false, error));
+    entries = manager.Snapshot();
+    SC13_EXPECT(entries.front().state == sc13::mods::ModState::Failed);
+    SC13_EXPECT(!manager.SetEnabled("dawid.better-sanitizer", true, error));
+    WriteModFixture(
+        sanitizer, "dawid.better-sanitizer", "Better Sanitizer", 360.0F);
+    SC13_EXPECT(manager.Refresh(error));
+    SC13_EXPECT(manager.SetEnabled("dawid.better-sanitizer", true, error));
+
+    const std::filesystem::path invalid = modsDirectory / L"BrokenMod";
+    std::error_code directoryError;
+    std::filesystem::create_directories(invalid, directoryError);
+    SC13_EXPECT(!directoryError);
+    WriteTextFile(invalid / L"mod.toon", "id: Invalid ID\n");
+    SC13_EXPECT(manager.Refresh(error));
+    entries = manager.Snapshot();
+    SC13_EXPECT(entries.size() == 2U);
+    SC13_EXPECT(registry.IsActive("dawid.better-sanitizer"));
+
+    std::filesystem::remove_all(sanitizer, directoryError);
+    SC13_EXPECT(!directoryError);
+    SC13_EXPECT(manager.Refresh(error));
+    entries = manager.Snapshot();
+    SC13_EXPECT(!registry.IsActive("dawid.better-sanitizer"));
+    SC13_EXPECT(manager.EnabledOrder().empty());
+    SC13_EXPECT(std::any_of(
+        entries.begin(), entries.end(), [](const sc13::mods::ModUiEntry& entry) {
+            return entry.id == "dawid.better-sanitizer" &&
+                   entry.state == sc13::mods::ModState::Missing;
+        }));
+
+    WriteModFixture(
+        modsDirectory / L"DuplicateOne", "test.duplicate", "Duplicate One", 410.0F);
+    WriteModFixture(
+        modsDirectory / L"DuplicateTwo", "test.duplicate", "Duplicate Two", 420.0F);
+    SC13_EXPECT(manager.Refresh(error));
+    entries = manager.Snapshot();
+    const auto duplicateFailures = std::count_if(
+        entries.begin(), entries.end(), [](const sc13::mods::ModUiEntry& entry) {
+            return entry.id == "test.duplicate" &&
+                   entry.state == sc13::mods::ModState::Failed &&
+                   entry.diagnostic.find("DuplicateOne") != std::string::npos &&
+                   entry.diagnostic.find("DuplicateTwo") != std::string::npos;
+        });
+    SC13_EXPECT(duplicateFailures == 2);
+
+    std::vector<sc13::mods::ModId> persisted;
+    SC13_EXPECT(sc13::mods::LoadEnabledState(statePath, persisted, error));
+    SC13_EXPECT(persisted.empty());
+    std::filesystem::remove_all(root, directoryError);
+    SC13_EXPECT(!directoryError);
+}
+
 /** Creates a minimal uncompressed DBPF v3 package containing one PROP resource. */
 [[nodiscard]] std::vector<std::byte> BuildSyntheticDbpf(
     const sc13::core::Tgi& tgi, std::span<const std::byte> resource, bool compressed) {
@@ -421,6 +965,14 @@ int main() {
     TestPatchedResourceCache();
     TestRefPack();
     TestProp();
+    TestToon();
+    TestModDefinitionParser();
+    TestPatchRegistry();
+    TestRuntimeResourceCache();
+    TestLoaderConfig();
+    TestLogEventClassification();
+    TestModStateStore();
+    TestModManager();
     TestDbpf();
     TestPeFile();
     if (g_failures == 0) {

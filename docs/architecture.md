@@ -1,91 +1,105 @@
 # Architecture
 
-## M2 boundary
+## Runtime flow
 
-M1 proved one late in-memory PROP change for
-`00B1B104:61EFC000:719436BD`, property `0x09AE19D7`, from `300.0` to `345.0`.
-M2 moves that exact change to the concrete synchronous PROP deserializer so every downstream
-consumer can receive the same value. The
-declarative mod format, Lua, overlay, legacy-package importer, and general patch registry remain
-future layers.
+```text
+Start-Simoder.bat (UAC)
+    -> simoder/simoder.exe watcher
+    -> EA App launches SimCity.exe
+    -> LoadLibraryW(sc13modloader.dll)
+    -> SC13_Initialize outside DllMain
+
+SimCity PROP deserializer
+    -> immutable PatchRegistrySnapshot lookup by exact TGI
+    -> retained vanilla RuntimeResourceCache entry
+    -> deterministic activation-order patch sequence
+    -> transactional value-bit writes to the game-owned table
+    -> cache commit only after every write succeeds
+```
+
+The normal unpatched hot path loads one atomic shared snapshot, performs one ordered-map TGI
+lookup, and returns. It does not scan mods, parse TOON, access the filesystem, or acquire the
+`ModManager` lock.
 
 ## Component boundaries
 
-```text
-sc13-launcher.exe
-    -> LoadLibraryW(sc13modloader.dll)
-    -> SC13_Initialize() outside DllMain
+- `simoder.exe`: elevated end-user watcher/injector and controlled detach client.
+- `sc13modloader.dll`: process bootstrap, build gate, hooks, logging, and UI lifetime.
+- `ModManager`: discovery, typed definitions, lifecycle, persistence, and UI snapshots.
+- `PatchRegistry`: active ownership, activation sequence, conflict metadata, and immutable
+  copy-on-write snapshots.
+- `RuntimeResourceCache`: vanilla/last-result retention, targeted invalidation epochs, rebuild
+  planning, and controlled-detach restoration snapshots.
+- `Simoder overlay`: rendering and input only; callbacks invoke `ModManager`.
+- `AsyncLogger`: the only file/console sinks. Producers emit semantic events.
+- `sc13_core`: game-independent TGI, hash, DBPF, RefPack, PROP, TOON, patch, and state logic.
+- optional `Simoder.McpServer.exe`: non-elevated stdio MCP surface with read/write annotations.
+- optional `Simoder.DevBridge.exe`: separately elevated, same-user Named Pipe broker restricted to
+  verified EA/SimCity/Simoder processes and capture-bound input.
 
-sc13modloader.dll
-    bootstrap -> build fingerprint -> module inventory
-              -> uniquely resolved PROP deserializer hook
-              -> exact TGI/property-vector validator
-              -> owned snapshot/cache
-              -> atomic four-byte pre-consumer 300.0 -> 345.0 patch and detach rollback
+`ModManager` does not parse PROP memory, implement hooks, render ImGui, or own log sinks.
 
-SC13_ENABLE_DISCOVERY_TRACE=ON
-    diagnostic -> filtered package API and stream trace
-               -> PFRecordRead and parsed-publisher trace
-               -> digest-addressed executable-image captures
+## Patch and cache invariants
 
-sc13_core
-    core       -> TGI, SHA-256
-               -> runtime property records, owned resource copies, patched-copy cache
-    formats    -> DBPF v3, RefPack, byte-preserving PROP
-    memory     -> validated signature parsing and exact-match scanning
+Activation sequence is the deterministic M3 patch order. Every registered resource block carries
+its stable owner ID and sequence. Same-TGI/same-property changes are recorded as conflicts;
+different properties of the same resource are not conflicts.
 
-sc13-inspect.exe
-    read-only package and resource validation
-
-sc13-memory-probe.exe
-    read-only live-memory evidence and bounded hexdumps
-```
-
-Generic parsers do not depend on game addresses. Reverse-engineered symbols and calling
-conventions live under `sc13::reverse`; hook mechanics live under `sc13::hooks`.
-
-## Bootstrap decision
-
-The current executable imports only `Core/Activation.dll` statically. Replacing that signed EA
-file with a proxy would violate the non-destructive installation requirement and is not justified
-by runtime module evidence. The first bootstrap therefore uses a separate x86 launcher:
-
-1. load the DLL into the selected x86 process;
-2. wait for `LoadLibraryW` to return;
-3. resolve the RVA of exported `SC13_Initialize` without executing local `DllMain`;
-4. invoke that export on a remote thread;
-5. let the game continue even when observation hooks cannot be installed.
-
-`DllMain` only stores its module handle and disables thread notifications.
-
-## Runtime patch boundary
-
-The verified M2 object path is:
+Disabling never reverses arithmetic. Each result is recomputed as:
 
 ```text
-runtime resource owner
-    -> TGI fields in instance/type/group order
-    -> vector {begin, end, capacity}
-    -> exactly 89 sorted 24-byte property records
-    -> property 0x09AE19D7, float metadata 0x000D0000
-    -> aligned atomic compare/exchange from 300.0 to 345.0
+retained vanilla + currently active ordered patches
 ```
 
-The M2 deserializer hook retains a loader-owned copy for validation and lifetime tests, but does not
-fabricate or return a cloned game object: its vtable, allocator, destructor, and reference-count
-contract are not established. After clean read-only proof, the mutation is one verified float in
-the game-owned vector before downstream caches receive it. The hook
-refuses an absent, ambiguous, differently laid-out, wrongly typed, or unexpectedly valued target.
-It records the exact value address and atomically restores `300.0` during shutdown only while the
-original TGI, vector bounds, aligned address, and replacement bits still match.
+Targeted invalidation occurs both before and after a registry publication. Per-TGI invalidation
+epochs prevent an in-flight old plan from committing across an ON/OFF transition. Existing cache
+entries retain owned vectors only; the loader never lends these buffers to the game, so invalidation
+cannot create dangling game pointers.
 
-## Failure behavior
+Runtime writes touch only `valueBits` after verifying sorted table structure, record identity,
+metadata/type, bounds, alignment, and finite arithmetic. A multi-property update uses compare/
+exchange and rolls back earlier writes if any later write fails. Detach restores vanilla only when
+the live resource still exactly matches the last committed result.
 
-- Signature absence or ambiguity means no internal hook.
-- The normal build resolves and installs only the critical deserializer hook; completed discovery
-  hooks cannot become accidental prerequisites for the patch.
-- Bootstrap errors are logged and returned to the launcher.
-- Hook-boundary functions are `noexcept` and use bounded state.
-- Filtered log queues drop records instead of blocking a hot game thread.
-- Closing the game and starting it normally removes every loader effect because no game file is
-  changed.
+ON/OFF and active-mod removal reuse the same compare/exchange transaction to rebuild retained live
+PROP instances immediately from vanilla plus the newly published registry generation. ON first
+rereads stable source bytes, allowing an OFF-state `overrides.toon` edit to take effect without a
+manual Refresh.
+
+## Threading and ownership
+
+- `ModManager` serializes discovery and lifecycle with its own mutex.
+- `PatchRegistry` serializes writers and atomically publishes immutable reader snapshots.
+- `RuntimeResourceCache` has an independent mutex; the hook never takes the manager lock.
+- game-memory value transitions use a small exclusive SRW lock separate from registry/cache locks.
+- `AsyncLogger` copies events into a bounded queue and drains batches on one worker thread.
+- ImGui state stays on the D3D9/window thread; UI snapshots are copied before rendering.
+
+Shutdown order is: disable hooks, restore the original WndProc and destroy ImGui, remove MinHook
+hooks, restore retained runtime resources, stop log capture, release mod services, then flush the
+logger.
+
+## Graceful degradation
+
+- unknown game fingerprint or ambiguous signature: no resource hook;
+- malformed/duplicate mod: that entry is `Failed`; other mods continue;
+- UI hook/context failure: runtime mods and game continue without UI;
+- DeveloperConsole failure: file logging continues;
+- unsafe resource layout/type/value: that resource remains unchanged;
+- existing objects that cannot be recreated safely: only future loads receive the new generation.
+
+Native SimCity UI integration, Lua, legacy package import, dependencies, online distribution, and
+arbitrary machine-code patching are outside M3.
+
+## Optional AI DevBridge boundary
+
+AI DevBridge is developer tooling and is not linked into `sc13modloader.dll`. The MCP process has
+no direct elevated input capability. Its sibling broker uses `PipeOptions.CurrentUserOnly`, an
+exact MCP executable-path check, a Windows-session check, and no TCP listener. EA/SimCity targets
+must pass process-name, installation-root, and Electronic Arts Authenticode checks. A coordinate
+action additionally requires a fresh image id and unchanged client geometry.
+
+UI Automation invocation is preferred when the pointed element exposes `InvokePattern`; CEF and
+DirectX surfaces fall back to foreground `SendInput`. UAC secure-desktop interaction, arbitrary
+text/keys/PIDs, termination, and automatic restart are intentionally absent. Infinite Loading is
+represented as a two-minute diagnostic suspicion after an AI-confirmed `CityLoading` stage.

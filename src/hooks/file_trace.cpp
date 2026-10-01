@@ -1,5 +1,7 @@
 #include "hooks/file_trace.hpp"
 
+#include "hooks/game_log_capture.hpp"
+#include "ui/simoder_overlay.hpp"
 #include "hooks/resource_trace.hpp"
 #include "logging/async_logger.hpp"
 #include "reverse/resource_symbols.hpp"
@@ -609,6 +611,14 @@ bool InstallTraceHooks(
             return false;
         }
 
+        std::string overlayError;
+        if (!ui::CreateSimoderOverlayHooks(overlayError)) {
+            logging::AsyncLogger::Instance().WriteFormat(
+                logging::Level::Warning,
+                "Simoder UI hooks were not created: %s; runtime mods continue",
+                overlayError.c_str());
+        }
+
         const bool created =
 #if defined(SC13_ENABLE_DISCOVERY_TRACE)
             CreateApiHook("CreateFileW", reinterpret_cast<LPVOID>(&HookCreateFileW),
@@ -630,13 +640,17 @@ bool InstallTraceHooks(
             CreateApiHook("CloseHandle", reinterpret_cast<LPVOID>(&HookCloseHandle),
                           reinterpret_cast<LPVOID*>(&g_originalCloseHandle), error) &&
             CreateStreamReadHook(fingerprint, error) &&
+            CreateGameLogCaptureHooks(error) &&
             CreateResourceTraceHook(fingerprint, error);
 #else
+            CreateGameLogCaptureHooks(error) &&
             CreateResourceTraceHook(fingerprint, error);
 #endif
         if (!created) {
             MH_RemoveHook(MH_ALL_HOOKS);
             MH_Uninitialize();
+            ui::ShutdownSimoderOverlay();
+            ResetGameLogCapture();
             ResetResourceTrace();
             return false;
         }
@@ -644,8 +658,11 @@ bool InstallTraceHooks(
         const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
         if (enableStatus != MH_OK) {
             error = std::string("MH_EnableHook failed: ") + MH_StatusToString(enableStatus);
+            MH_DisableHook(MH_ALL_HOOKS);
+            ui::ShutdownSimoderOverlay();
             MH_RemoveHook(MH_ALL_HOOKS);
             MH_Uninitialize();
+            ResetGameLogCapture();
             ResetResourceTrace();
             return false;
         }
@@ -653,8 +670,10 @@ bool InstallTraceHooks(
         return true;
     } catch (...) {
         error = "Runtime resource hook setup failed due to an allocation exception";
+        ui::ShutdownSimoderOverlay();
         MH_RemoveHook(MH_ALL_HOOKS);
         MH_Uninitialize();
+        ResetGameLogCapture();
         ResetResourceTrace();
         return false;
     }
@@ -665,8 +684,10 @@ void UninstallTraceHooks() noexcept {
         return;
     }
     MH_DisableHook(MH_ALL_HOOKS);
+    ui::ShutdownSimoderOverlay();
     MH_RemoveHook(MH_ALL_HOOKS);
     MH_Uninitialize();
+    ResetGameLogCapture();
     ResetResourceTrace();
     g_originalStreamRead = nullptr;
     g_installed = false;

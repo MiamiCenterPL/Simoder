@@ -1,10 +1,15 @@
 /build/
+**/bin/
+**/obj/
 /logs/
 /captures/
+/mods/
+/simoder/
 /.vs/
 *.package
 *.pdb
 *.ilk
+*.obj
 *.user
 *.suo
 *.VC.db

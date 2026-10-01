@@ -1,0 +1,7 @@
+patches[1]:
+  - target:
+      type: 0x00B1B104
+      group: 0x61EFC000
+      instance: 0x719436BD
+    properties[1]{id,type,operation,value}:
+      0x09AE19D7,float,set,345

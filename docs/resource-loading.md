@@ -22,10 +22,14 @@ publisher at RVA `0x000099F0`, the stream-read wrapper at RVA `0x004E9630`, and 
 deserializer at RVA `0x00009710`. The early PID 27996 experiment proved that the target preload
 bypasses the first two candidates. The stream trace led to the runtime object, whose vtable then
 identified the deserializer. All four discovery addresses are exact-fingerprint gated and resolve
-from unique signatures. The normal M2 build does not install these completed investigation hooks
+from unique signatures. The normal M3 build does not install these completed investigation hooks
 and does not require their signatures to resolve.
 
-## Production M2 layer
+## Historical M2 production layer
+
+This section records the evidence that established the interception primitive. M3 retains the
+same verified deserializer boundary but replaces the single hardcoded patch with typed
+`PatchRegistry` lookup and `RuntimeResourceCache` rebuilds.
 
 The normal build resolves only the concrete PROP deserializer at RVA `0x00009710` and installs
 one hook. A no-match resource pays only the original call plus a 12-byte identity check. Detailed
