@@ -198,4 +198,7 @@ Detailed behavior is documented in [architecture](docs/architecture.md),
 ## Repository policy
 
 Proprietary EA binaries and package files are excluded. Tests use generated text and synthetic
-binary fixtures. No license has been selected yet; choose one before public distribution.
+binary fixtures. Simoder's original code and documentation are licensed under
+the [MIT License](LICENSE). External components retain their own licenses; see
+[third-party notices](THIRD_PARTY_NOTICES.md). Game files and externally imported
+catalog data are not relicensed by Simoder.

@@ -4,6 +4,7 @@
   "description": "TOON mod validation and resolved symbol completion through simoder-dev.",
   "version": "0.1.0",
   "publisher": "simoder",
+  "license": "MIT",
   "engines": { "vscode": "^1.90.0" },
   "main": "./extension.js",
   "activationEvents": ["onLanguage:simoder-toon", "onCommand:simoder.validateMod"],

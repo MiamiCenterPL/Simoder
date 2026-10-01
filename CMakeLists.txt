@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.24)
 
 project(SC13ModLoader VERSION 0.1.0 LANGUAGES C CXX)
 
+install(FILES LICENSE THIRD_PARTY_NOTICES.md DESTINATION simoder/licenses)
+
 if(NOT WIN32)
     message(FATAL_ERROR "SC13 Mod Loader currently targets Windows only.")
 endif()
@@ -209,6 +211,7 @@ if(SC13_BUILD_RUNTIME)
         install(FILES devtools/vscode/package.json devtools/vscode/extension.js
             devtools/vscode/helpers.js devtools/vscode/snippets.json devtools/vscode/README.md
             DESTINATION simoder/DevTools/VSCode)
+        install(FILES LICENSE DESTINATION simoder/DevTools/VSCode)
         configure_file(
             cmake/InstallAiDevTools.cmake.in
             "${CMAKE_CURRENT_BINARY_DIR}/InstallAiDevTools.cmake"

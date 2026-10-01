@@ -16,18 +16,18 @@ internal sealed class WindowsGraphicsCaptureService
     /// <summary>Gets the last bounded-capture failure for broker diagnostics.</summary>
     public string? LastFailure { get; private set; }
 
-    /// <summary>Attempts a bounded WGC capture and returns null when the platform path is unavailable.</summary>
+    /// <summary>@summary Attempts a bounded WGC capture and returns null when the platform path is unavailable.</summary>
     public async Task<byte[]?> TryCapturePngAsync(IntPtr windowHandle, TimeSpan timeout)
     {
         LastFailure = null;
-        if (!GraphicsCaptureSession.IsSupported())
-        {
-            LastFailure = "Windows Graphics Capture is not supported on this Windows installation.";
-            return null;
-        }
-
         try
         {
+            if (!GraphicsCaptureSession.IsSupported())
+            {
+                LastFailure = "Windows Graphics Capture is not supported on this Windows installation.";
+                return null;
+            }
+
             var item = CreateItemForWindow(windowHandle);
             var learningDevice = new LearningModelDevice(LearningModelDeviceKind.DirectX);
             using var framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
