@@ -30,6 +30,10 @@ lookup, and returns. It does not scan mods, parse TOON, access the filesystem, o
   copy-on-write snapshots.
 - `RuntimeResourceCache`: vanilla/last-result retention, targeted invalidation epochs, rebuild
   planning, and controlled-detach restoration snapshots.
+- `RuntimeDiagnostics`: owned polling worker for pending-definition detection and atomic JSON
+  publication; stops before hook/service shutdown and performs no hot-path filesystem work.
+- `simoder-dev`: offline source validation, ordered dry-run, JSON explanations, catalog search
+  and new-mod scaffolding using the same typed parser/arithmetic as runtime.
 - `Simoder overlay`: rendering and input only; callbacks invoke `ModManager`.
 - `AsyncLogger`: the only file/console sinks. Producers emit semantic events.
 - `sc13_core`: game-independent TGI, hash, DBPF, RefPack, PROP, TOON, patch, and state logic.
@@ -88,7 +92,8 @@ logger.
 - unsafe resource layout/type/value: that resource remains unchanged;
 - existing objects that cannot be recreated safely: only future loads receive the new generation.
 
-Native SimCity UI integration, Lua, legacy package import, dependencies, online distribution, and
+OpenSCP property-export interchange and registry dictionaries are offline adapters. Native
+SimCity UI integration, Lua, legacy package import, dependencies, online distribution, and
 arbitrary machine-code patching are outside M3.
 
 ## Optional AI DevBridge boundary

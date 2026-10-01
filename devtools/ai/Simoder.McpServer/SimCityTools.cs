@@ -10,6 +10,17 @@ namespace Simoder.McpServer;
 [McpServerToolType]
 public sealed class SimCityTools
 {
+    /// <summary>@summary Lists mod definitions, pending changes, conflicts and historical application evidence.</summary>
+    [McpServerTool(Name = "simoder_get_runtime_state", Destructive = false, ReadOnly = true, Idempotent = true, OpenWorld = false, UseStructuredContent = true)]
+    [Description("Read Simoder mods, resolved overrides, pending changes, conflicts and resource observations. Check available/fresh; snapshots and committed values are historical evidence, not gameplay acceptance.")]
+    public Task<JsonElement> GetRuntimeStateAsync(CancellationToken cancellationToken = default) =>
+        client_.GetRuntimeEvidenceAsync(cancellationToken);
+
+    /// <summary>@summary Returns a bounded tail from the fixed Simoder log.</summary>
+    [McpServerTool(Name = "simoder_get_logs", Destructive = false, ReadOnly = true, Idempotent = true, OpenWorld = false, UseStructuredContent = true)]
+    [Description("Read up to 200 recent Simoder log lines, optionally filtering one exact mod ID. Does not change game state or launch anything.")]
+    public Task<JsonElement> GetModLogsAsync(string? modId = null, int limit = 80, CancellationToken cancellationToken = default) =>
+        client_.GetModLogsAsync(new ModLogsRequest(modId, limit), cancellationToken);
     /// <summary>Provides cross-tool safety and workflow guidance to MCP clients.</summary>
     public const string ServerInstructions =
         "Simoder DevBridge controls only verified EA App and SimCity windows. Start with simcity_start_session, approve UAC manually, then alternate state/capture with capture-bound click or allowlisted keys. Confirm visually inferred stages with the exact capture_id. Never claim the city loaded until in_city is confirmed. Suspected Infinite Loading is diagnostic only: do not terminate or restart the game.";

@@ -1,0 +1,12 @@
+{
+  "Float property patch": {
+    "prefix": "floatpatch",
+    "body": ["properties[1]{name,type,operation,value}:", "  ${1:propertyName},float,${2|set,add,subtract,multiply,divide|},${3:345}"],
+    "description": "One named scalar float override"
+  },
+  "Documented property alias": {
+    "prefix": "propertyalias",
+    "body": ["properties[1]{name,id,source,type,description,origin}:", "  ${1:propertyName},${2:0x09AE19D7},${3:source},float,${4:description},${5|local_alias,registry,reverse_engineering|}"],
+    "description": "One explicit symbol with provenance"
+  }
+}

@@ -55,3 +55,12 @@ Before deleting DevTools, unregister the same scope:
 6. Treat `suspected_infinite_loading` as diagnostic only and collect `simcity_get_diagnostics`.
 
 The workflow succeeds only after `in_city` is confirmed from a fresh SimCity capture.
+
+## Mod development evidence
+
+`simoder_get_runtime_state` reads mods, resolved overrides, pending changes, conflicts and bounded
+historical resource observations from the loader's atomic snapshot. Check `available` and `fresh`.
+A fresh snapshot requires the verified SimCity PID, consistent generation and age <= 5 seconds;
+it does not establish consumer/gameplay acceptance. `simoder_get_logs` reads at most 200 lines
+from the fixed loader log's last 64 KiB and can filter one exact mod ID. Both tools are read-only,
+cause no UAC prompt, and require the existing broker. See `docs/developer-experience.md` in source.

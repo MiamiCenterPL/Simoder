@@ -54,6 +54,10 @@ public:
         const ModId& owner,
         std::set<core::Tgi>& affected,
         std::string& error) noexcept;
+    /** @summary Replaces an active owner's patches in one publication while preserving activation order. */
+    [[nodiscard]] bool Replace(const ModId& owner,
+        std::span<const ResourcePatchDefinition> patches,
+        std::set<core::Tgi>& affected, std::string& error) noexcept;
 
     /** Atomically loads the current immutable snapshot. */
     [[nodiscard]] std::shared_ptr<const PatchRegistrySnapshot> Current() const noexcept;

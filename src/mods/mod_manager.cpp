@@ -45,6 +45,11 @@ void AppendError(std::string& destination, std::string_view message) {
         error = "overrides.toon fingerprint: " + error;
         return false;
     }
+    std::error_code statusError;
+    fingerprint.hasSymbols = std::filesystem::exists(directory / L"symbols.toon", statusError);
+    if (statusError) { error = "symbols.toon fingerprint: " + statusError.message(); return false; }
+    if (fingerprint.hasSymbols &&
+        !core::Sha256File(directory / L"symbols.toon", fingerprint.symbols, error)) return false;
     return true;
 }
 
@@ -303,12 +308,12 @@ bool ModManager::RefreshLocked(std::string& error) {
                 record.pendingFingerprint = candidate->second.fingerprint;
                 record.state = ModState::Changed;
                 record.diagnostic =
-                    "Files changed while active; switch OFF and ON to load the new version";
+                    "Files changed while active; preview and Reload, or switch OFF/ON";
             } else {
                 record.pendingDefinition.reset();
                 record.pendingFingerprint.reset();
+                if (record.state == ModState::Changed) record.diagnostic.clear();
                 record.state = ModState::Active;
-                record.diagnostic.clear();
             }
         } else {
             record.definition = std::move(candidate->second.definition);
@@ -494,6 +499,57 @@ bool ModManager::SetEnabled(
     }
 }
 
+bool ModManager::Reload(const ModId& id, std::string& error, std::string_view expectedRevision) noexcept {
+    try {
+        const std::scoped_lock lock(mutex_);
+        error.clear();
+        if (!RefreshLocked(error)) return false;
+        const auto found = records_.find(id);
+        if (found == records_.end() || !registry_.IsActive(id) || !found->second.pendingDefinition) {
+            error = "No valid pending definition for an active mod";
+            return false;
+        }
+        auto& record = found->second;
+        const auto& fingerprint = *record.pendingFingerprint;
+        const auto revision = core::ToHex(fingerprint.manifest) + core::ToHex(fingerprint.overrides) +
+            (fingerprint.hasSymbols ? core::ToHex(fingerprint.symbols) : "absent");
+        if (!expectedRevision.empty() && expectedRevision != revision) {
+            error = "Reload preview is stale; review the latest pending definition";
+            return false;
+        }
+        const auto& pending = *record.pendingDefinition;
+        auto affected = CollectTargets(record.definition);
+        const auto newTargets = CollectTargets(pending);
+        affected.insert(newTargets.begin(), newTargets.end());
+        for (const auto& entry : cache_.SnapshotForRestore()) {
+            if (!affected.contains(entry.key.target)) continue;
+            std::vector<RegisteredPatch> patches;
+            std::uint64_t sequence = 0;
+            for (const auto& owner : enabledOrder_) {
+                const auto& definition = owner == id ? pending : records_.at(owner).definition;
+                for (const auto& patch : definition.patches)
+                    if (patch.target == entry.key.target) patches.push_back(RegisteredPatch{owner, patch, sequence});
+                ++sequence;
+            }
+            std::vector<core::RuntimePropertyRecord> result;
+            if (!ApplyPatchSequence(entry.key.target, entry.vanilla, patches, result, error)) {
+                record.diagnostic = "Reload rejected: " + error;
+                return false;
+            }
+        }
+        // /** @summary Invalidate around a single publication so in-flight old plans cannot commit. */
+        static_cast<void>(cache_.Invalidate(affected));
+        if (!registry_.Replace(id, pending.patches, affected, error)) return false;
+        static_cast<void>(cache_.Invalidate(affected));
+        record.definition = std::move(*record.pendingDefinition);
+        record.fingerprint = *record.pendingFingerprint;
+        record.pendingDefinition.reset(); record.pendingFingerprint.reset();
+        record.state = ModState::Active; record.diagnostic.clear();
+        RefreshRuntimeResourcesLocked(affected, record, "reload");
+        return true;
+    } catch (...) { error = "Reload failed safely with an exception"; return false; }
+}
+
 std::vector<ModUiEntry> ModManager::Snapshot() const {
     const std::scoped_lock lock(mutex_);
     std::vector<ModUiEntry> result;
@@ -509,7 +565,13 @@ std::vector<ModUiEntry> ModManager::Snapshot() const {
             record.state == ModState::Inactive && !registered,
             registered,
             record.state == ModState::Changed,
-            record.diagnostic});
+            record.diagnostic,
+            record.definition.patches,
+            record.pendingDefinition ? record.pendingDefinition->patches : std::vector<ResourcePatchDefinition>{},
+            registered && record.pendingDefinition.has_value(),
+            record.pendingFingerprint ? core::ToHex(record.pendingFingerprint->manifest) +
+                core::ToHex(record.pendingFingerprint->overrides) +
+                (record.pendingFingerprint->hasSymbols ? core::ToHex(record.pendingFingerprint->symbols) : "absent") : ""});
     }
     result.insert(result.end(), failedDiscoveries_.begin(), failedDiscoveries_.end());
     return result;
@@ -522,6 +584,12 @@ std::vector<ModId> ModManager::EnabledOrder() const {
 
 std::vector<PatchConflict> ModManager::Conflicts() const {
     return registry_.Current()->conflicts();
+}
+std::vector<runtime::RuntimeResourceObservation> ModManager::RuntimeObservations() const {
+    return cache_.Observations();
+}
+PatchGeneration ModManager::Generation() const noexcept {
+    return registry_.Current()->generation();
 }
 
 bool ModManager::PersistOrder(

@@ -49,6 +49,19 @@ struct RuntimeResourceRestoreEntry final {
     std::vector<core::RuntimePropertyRecord> lastApplied;
 };
 
+/** @summary Captures observed resource outcomes; successful cache data is historical, not a live pointer read. */
+struct RuntimeResourceObservation final {
+    RuntimeResourceKey key{};
+    mods::PatchGeneration generation{};
+    std::string status;
+    std::string diagnostic;
+    std::vector<core::RuntimePropertyRecord> vanilla;
+    std::vector<core::RuntimePropertyRecord> applied;
+    std::uint64_t observedAtUnixMs{};
+    /** @summary Distinguishes the last successful value snapshot from a later rejected attempt. */
+    mods::PatchGeneration committedGeneration{};
+};
+
 /** Retains reproducible vanilla-derived resource generations without lending pointers to the game. */
 class RuntimeResourceCache final {
 public:
@@ -78,6 +91,11 @@ public:
 
     /** Returns owned restoration snapshots without exposing internal cache storage. */
     [[nodiscard]] std::vector<RuntimeResourceRestoreEntry> SnapshotForRestore() const;
+    /** @summary Records an observed rejection without retaining a dereferenceable game pointer. */
+    void RecordFailure(const RuntimeResourceKey& key, mods::PatchGeneration generation,
+        std::string_view reason) noexcept;
+    /** @summary Returns bounded historical evidence for UI and external tools. */
+    [[nodiscard]] std::vector<RuntimeResourceObservation> Observations() const;
 
     /** Releases loader-owned snapshots during controlled shutdown. */
     void Clear() noexcept;
@@ -94,6 +112,7 @@ private:
     mutable std::mutex mutex_;
     std::map<RuntimeResourceKey, Entry> entries_;
     std::map<core::Tgi, std::uint64_t> invalidationEpochs_;
+    std::map<RuntimeResourceKey, RuntimeResourceObservation> observations_;
 };
 
 /** Returns a stable diagnostic label for a cache build status. */

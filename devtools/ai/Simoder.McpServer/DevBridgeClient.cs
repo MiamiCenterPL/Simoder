@@ -57,6 +57,12 @@ public sealed class DevBridgeClient
     /// <summary>Reads a bounded diagnostic bundle without restarting or terminating anything.</summary>
     public Task<DiagnosticSnapshot> GetDiagnosticsAsync(CancellationToken cancellationToken) =>
         CallAsync<object, DiagnosticSnapshot>(BrokerCommand.GetDiagnostics, new { }, TimeSpan.FromSeconds(15), cancellationToken);
+    /// <summary>@summary Reads current or explicitly stale cached loader evidence without causing UAC.</summary>
+    public Task<JsonElement> GetRuntimeEvidenceAsync(CancellationToken cancellationToken) =>
+        CallAsync<object, JsonElement>(BrokerCommand.GetRuntimeEvidence, new { }, TimeSpan.FromSeconds(5), cancellationToken);
+    /// <summary>@summary Reads a bounded mod-filtered log tail without accepting external paths.</summary>
+    public Task<JsonElement> GetModLogsAsync(ModLogsRequest request, CancellationToken cancellationToken) =>
+        CallAsync<ModLogsRequest, JsonElement>(BrokerCommand.GetModLogs, request, TimeSpan.FromSeconds(5), cancellationToken);
 
     /// <summary>Calls the private pipe and gives disconnected read tools a clear recovery instruction.</summary>
     private async Task<TResponse> CallAsync<TRequest, TResponse>(

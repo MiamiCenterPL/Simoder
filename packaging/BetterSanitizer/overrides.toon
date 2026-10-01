@@ -1,7 +1,10 @@
+symbols:
+  resources[1]{name,type,group,instance,source}:
+    BetterSanitizer,0x00B1B104,0x61EFC000,0x719436BD,Simoder verified TGI - docs/reverse-engineering.md
+  properties[1]{name,id,source,type,description,origin}:
+    sanitizerOperatingCost,0x09AE19D7,Simoder local alias - verified cost effect - original EA name unknown,float,Verified effect on sanitizer operating cost,local_alias
 patches[1]:
   - target:
-      type: 0x00B1B104
-      group: 0x61EFC000
-      instance: 0x719436BD
-    properties[1]{id,type,operation,value}:
-      0x09AE19D7,float,set,345
+      name: BetterSanitizer
+    properties[1]{name,type,operation,value}:
+      sanitizerOperatingCost,float,set,345

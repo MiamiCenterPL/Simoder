@@ -38,6 +38,11 @@ internal sealed class BrokerService
             BrokerCommand.WaitForStage => await WaitForStageAsync(
                 Deserialize<WaitForStageRequest>(request.Payload), cancellationToken).ConfigureAwait(false),
             BrokerCommand.GetDiagnostics => GetDiagnostics(),
+            BrokerCommand.GetRuntimeEvidence => RuntimeEvidenceReader.Read(gameRoot_,
+                processWindows_.GetProcesses().Where(process => process.IsAllowed &&
+                    process.Name.Equals("SimCity", StringComparison.OrdinalIgnoreCase))
+                    .Select(process => process.ProcessId).ToHashSet(), DateTimeOffset.UtcNow),
+            BrokerCommand.GetModLogs => GetModLogs(Deserialize<ModLogsRequest>(request.Payload)),
             _ => throw new ArgumentOutOfRangeException(nameof(request), "Unknown broker command."),
         };
     }
@@ -66,6 +71,14 @@ internal sealed class BrokerService
             return coordinator_.Fail(exception.Message, processes, windows, DateTimeOffset.UtcNow);
         }
     }
+
+    /// <summary>@summary Reads only the fixed Simoder log with optional mod filtering.</summary>
+    private object GetModLogs(ModLogsRequest request) => new
+    {
+        lines = RuntimeEvidenceReader.ReadLogs(gameRoot_, request.ModId, request.Limit),
+        modId = request.ModId,
+        readAtUtc = DateTimeOffset.UtcNow,
+    };
 
     /// <summary>Starts one elevated Simoder watcher as a child of the already-elevated broker.</summary>
     private void StartWatcherIfNeeded()

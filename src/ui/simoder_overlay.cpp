@@ -2,6 +2,7 @@
 
 #include "logging/async_logger.hpp"
 #include "mods/mod_manager.hpp"
+#include "runtime/runtime_resource_cache.hpp"
 #include "mods/mod_types.hpp"
 
 #include <Windows.h>
@@ -13,6 +14,7 @@
 #include <imgui_impl_win32.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -393,6 +395,8 @@ void RenderSimoder() {
             const std::vector<mods::ModUiEntry> entries =
                 g_manager == nullptr ? std::vector<mods::ModUiEntry>{}
                                      : g_manager->Snapshot();
+            const auto runtimeObservations = g_manager == nullptr ? std::vector<runtime::RuntimeResourceObservation>{}
+                : g_manager->RuntimeObservations();
             if (ImGui::BeginTable(
                     "ModTable", 5,
                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -410,6 +414,56 @@ void RenderSimoder() {
                     ImGui::TextUnformatted(entry.name.c_str());
                     if (!entry.diagnostic.empty() && ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("%s", entry.diagnostic.c_str());
+                    }
+                    if (ImGui::TreeNode("Resolved overrides")) {
+                        for (const auto& patch : entry.patches) {
+                            ImGui::TextWrapped("%s TGI=%s", patch.name.c_str(),
+                                core::ToString(patch.target).c_str());
+                            if (!patch.source.empty()) ImGui::TextWrapped("Source: %s", patch.source.c_str());
+                            const auto observedCount = std::count_if(runtimeObservations.begin(), runtimeObservations.end(),
+                                [&patch](const auto& observation) { return observation.key.target == patch.target; });
+                            const auto appliedCount = std::count_if(runtimeObservations.begin(), runtimeObservations.end(),
+                                [&patch](const auto& observation) { return observation.key.target == patch.target && observation.status == "applied"; });
+                            ImGui::Text("Retained observations: %llu; applied: %llu (historical)",
+                                static_cast<unsigned long long>(observedCount), static_cast<unsigned long long>(appliedCount));
+                            for (const auto& property : patch.properties) {
+                                ImGui::TextWrapped("%s [0x%08X] %s %.9g", property.name.c_str(),
+                                    property.propertyId, mods::PatchOperationName(property.operation), property.value);
+                                if (!property.source.empty()) ImGui::TextWrapped("Source: %s", property.source.c_str());
+                                if (!property.description.empty()) ImGui::TextWrapped("%s", property.description.c_str());
+                                if (!property.unit.empty()) ImGui::TextWrapped("Unit: %s", property.unit.c_str());
+                                if (!property.origin.empty()) ImGui::TextWrapped("Origin: %s", property.origin.c_str());
+                                for (const auto& observation : runtimeObservations) {
+                                    if (observation.key.target != patch.target) continue;
+                                    const auto vanilla = core::ReadRuntimeFloat(observation.vanilla, property.propertyId);
+                                    const auto applied = core::ReadRuntimeFloat(observation.applied, property.propertyId);
+                                    ImGui::TextWrapped("Observed instance=%llu generation=%llu %s: %s",
+                                        static_cast<unsigned long long>(observation.key.resourceAddress),
+                                        static_cast<unsigned long long>(observation.generation),
+                                        observation.status.c_str(), observation.diagnostic.c_str());
+                                    if (vanilla && applied) ImGui::Text("Historical vanilla %.9g -> committed %.9g", *vanilla, *applied);
+                                }
+                            }
+                            if (std::none_of(runtimeObservations.begin(), runtimeObservations.end(),
+                                [&patch](const auto& observation) { return observation.key.target == patch.target; }))
+                                ImGui::TextUnformatted("No retained observation for this resource.");
+                        }
+                        ImGui::TreePop();
+                    }
+                    if (entry.canReload && ImGui::TreeNode("Pending changes (current -> pending)")) {
+                        ImGui::TextUnformatted("Current operations:");
+                        for (const auto& patch : entry.patches) for (const auto& property : patch.properties)
+                            ImGui::TextWrapped("%s %s [0x%08X] %s %.9g", core::ToString(patch.target).c_str(),
+                                property.name.c_str(), property.propertyId, mods::PatchOperationName(property.operation), property.value);
+                        ImGui::TextUnformatted("Pending operations:");
+                        for (const auto& patch : entry.pendingPatches) for (const auto& property : patch.properties)
+                            ImGui::TextWrapped("%s %s [0x%08X] %s %.9g", core::ToString(patch.target).c_str(),
+                                property.name.c_str(), property.propertyId, mods::PatchOperationName(property.operation), property.value);
+                        if (ImGui::Button("Apply validated reload")) {
+                            std::string error;
+                            g_feedback = g_manager->Reload(entry.id, error, entry.pendingRevision) ? "Reload published; inspect resource outcomes." : "Reload rejected: " + error;
+                        }
+                        ImGui::TreePop();
                     }
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(entry.version.c_str());

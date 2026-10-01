@@ -159,6 +159,26 @@ std::shared_ptr<const PatchRegistrySnapshot> PatchRegistry::Current() const noex
     return current_.load(std::memory_order_acquire);
 }
 
+bool PatchRegistry::Replace(const ModId& owner, std::span<const ResourcePatchDefinition> patches,
+    std::set<core::Tgi>& affected, std::string& error) noexcept {
+    try {
+        error.clear(); affected.clear();
+        const std::scoped_lock lock(mutationMutex_);
+        const auto existing = active_.find(owner);
+        if (existing == active_.end() || patches.empty()) { error = "Replace requires an active owner and patches"; return false; }
+        auto candidate = active_;
+        for (const auto& patch : existing->second.patches) affected.insert(patch.target);
+        for (const auto& patch : patches) affected.insert(patch.target);
+        candidate.at(owner).patches.assign(patches.begin(), patches.end());
+        const auto nextGeneration = generation_ + 1U;
+        auto snapshot = BuildSnapshot(candidate, nextGeneration);
+        active_ = std::move(candidate);
+        generation_ = nextGeneration;
+        current_.store(std::move(snapshot), std::memory_order_release);
+        return true;
+    } catch (...) { affected.clear(); error = "Patch replacement failed before publication"; return false; }
+}
+
 bool PatchRegistry::IsActive(const ModId& owner) const {
     const std::scoped_lock lock(mutationMutex_);
     return active_.contains(owner);

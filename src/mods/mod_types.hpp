@@ -53,12 +53,22 @@ struct PropertyPatch final {
     PropertyType type{PropertyType::Float};
     PatchOperation operation{PatchOperation::Set};
     float value{};
+    /** @summary Retains the selected alias and its documented origin for diagnostics. */
+    std::string name;
+    std::string source;
+    /** @summary Preserves optional registry descriptions and declared semantics without inventing units. */
+    std::string description;
+    std::string unit;
+    std::string origin;
 };
 
 /** Groups deterministic property operations for one exact resource. */
 struct ResourcePatchDefinition final {
     core::Tgi target{};
     std::vector<PropertyPatch> properties;
+    /** @summary Retains the resource alias without changing numeric runtime identity. */
+    std::string name;
+    std::string source;
 };
 
 /** Owns one validated mod's metadata and declarative patches. */
@@ -94,6 +104,13 @@ struct ModUiEntry final {
     bool canDisable{};
     bool changed{};
     std::string diagnostic;
+    /** @summary Describes the resolved operations shown in the mod inspector. */
+    std::vector<ResourcePatchDefinition> patches;
+    /** @summary Contains a validated pending definition for the before/after preview. */
+    std::vector<ResourcePatchDefinition> pendingPatches;
+    bool canReload{};
+    /** @summary Binds a displayed reload preview to the exact pending source fingerprints. */
+    std::string pendingRevision;
 };
 
 /** Returns a stable diagnostic label for a lifecycle state. */

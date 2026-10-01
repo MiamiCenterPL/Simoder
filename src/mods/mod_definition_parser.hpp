@@ -15,5 +15,8 @@ namespace sc13::mods {
 
 /** Validates a stable reverse-domain-like mod identity. */
 [[nodiscard]] bool IsValidModId(std::string_view id) noexcept;
+/** @summary Returns catalog entries for completion even when patch definitions are incomplete. */
+[[nodiscard]] bool ListSymbolsJson(const std::filesystem::path& directory,
+    std::string_view query, std::string& json, std::string& error) noexcept;
 
 }  // namespace sc13::mods

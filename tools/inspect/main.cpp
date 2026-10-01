@@ -1,6 +1,7 @@
 #include "core/sha256.hpp"
 #include "core/tgi.hpp"
 #include "formats/dbpf/dbpf_reader.hpp"
+#include "mods/mod_definition_parser.hpp"
 #include "formats/prop/prop_document.hpp"
 
 #include <charconv>
@@ -47,6 +48,7 @@ using sc13::formats::dbpf::DbpfPackage;
 void PrintUsage() {
     std::wcerr
         << L"Usage:\n"
+        << L"  sc13-inspect mod <mod-directory>\n"
         << L"  sc13-inspect file <package> <TYPE:GROUP:INSTANCE> [property-id]\n"
         << L"  sc13-inspect scan <directory> <TYPE:GROUP:INSTANCE> [property-id]\n";
 }
@@ -125,8 +127,26 @@ void PrintUsage() {
 
 }  // namespace
 
-/** Runs the read-only DBPF/TGI inspection utility. */
+/** @summary Runs read-only DBPF/TGI inspection or resolves one declarative mod without the game. */
 int wmain(int argumentCount, wchar_t** arguments) {
+    if (argumentCount == 3 && std::wstring_view(arguments[1]) == L"mod") {
+        sc13::mods::ModDefinition definition;
+        std::string error;
+        if (!sc13::mods::LoadModDefinition(arguments[2], definition, error)) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        for (const auto& patch : definition.patches) {
+            std::cout << patch.name << " TGI=" << sc13::core::ToString(patch.target)
+                << " source=" << patch.source << '\n';
+            for (const auto& property : patch.properties) {
+                std::cout << property.name << " id=0x" << std::hex << property.propertyId
+                    << std::dec << ' ' << sc13::mods::PatchOperationName(property.operation)
+                    << ' ' << property.value << " source=" << property.source << '\n';
+            }
+        }
+        return 0;
+    }
     if (argumentCount < 4 || argumentCount > 5) {
         PrintUsage();
         return 2;

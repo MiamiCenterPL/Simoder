@@ -64,6 +64,8 @@ public enum BrokerCommand
     ConfirmStage,
     WaitForStage,
     GetDiagnostics,
+    GetRuntimeEvidence,
+    GetModLogs,
 }
 
 /// <summary>Defines the explicit destination selected for a startup session.</summary>
@@ -146,6 +148,8 @@ public sealed record DiagnosticSnapshot(
 
 /// <summary>Requests creation of a startup session.</summary>
 public sealed record StartSessionRequest(LaunchTarget Target);
+/// <summary>@summary Selects a bounded fixed-log tail without accepting filesystem paths.</summary>
+public sealed record ModLogsRequest(string? ModId, int Limit = 80);
 
 /// <summary>Requests capture of an allowlisted EA or SimCity window.</summary>
 public sealed record CaptureWindowRequest(string Target = "auto");

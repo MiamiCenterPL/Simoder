@@ -1,4 +1,7 @@
 #include "config/loader_config.hpp"
+#include "dev/mod_validation.hpp"
+#include "dev/runtime_diagnostics.hpp"
+#include "core/json.hpp"
 #include "core/tgi.hpp"
 #include "core/patched_resource_cache.hpp"
 #include "core/resource_filter.hpp"
@@ -23,12 +26,14 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -435,6 +440,69 @@ void TestModDefinitionParser() {
         sc13::mods::PatchOperation::Set);
     SC13_EXPECT(definition.patches.front().properties.front().value == 345.0F);
 
+    /** @summary Exercises semantic aliases and rejection before patch registration. */
+    const std::string symbols =
+        "symbols:\n"
+        "  resources[1]{name,type,group,instance,source}:\n"
+        "    sanitizer,0x00B1B104,0x61EFC000,0x719436BD,test fixture\n"
+        "  properties[1]{name,id,source}:\n"
+        "    cost,0x09AE19D7,test fixture\n";
+    const std::string namedPatch =
+        "patches[1]:\n"
+        "  - target:\n"
+        "      name: sanitizer\n"
+        "    properties[1]{name,type,operation,value}:\n"
+        "      cost,float,set,345\n";
+    WriteTextFile(directory / L"overrides.toon", symbols + namedPatch);
+    SC13_EXPECT(sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(definition.patches.front().target == expectedTarget);
+    SC13_EXPECT(definition.patches.front().properties.front().propertyId == 0x09AE19D7U);
+    SC13_EXPECT(definition.patches.front().properties.front().name == "cost");
+    SC13_EXPECT(definition.patches.front().properties.front().source == "test fixture");
+    WriteTextFile(directory / L"symbols.toon", symbols);
+    WriteTextFile(directory / L"overrides.toon", namedPatch);
+    SC13_EXPECT(sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(definition.patches.front().name == "sanitizer");
+    WriteTextFile(directory / L"overrides.toon", symbols + namedPatch);
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("Duplicate symbol") != std::string::npos);
+    SC13_EXPECT(std::filesystem::remove(directory / L"symbols.toon"));
+    WriteTextFile(directory / L"overrides.toon", namedPatch);
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("Unknown resource") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon", symbols +
+        "patches[1]:\n  - target:\n      name: sanitizer\n"
+        "    properties[1]{name,id,type,operation,value}:\n"
+        "      cost,0x01,float,set,345\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("mismatch") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon", symbols +
+        "patches[1]:\n  - target:\n      name: sanitizer\n"
+        "      type: 0x01\n      group: 0x61EFC000\n      instance: 0x719436BD\n"
+        "    properties[1]{name,type,operation,value}:\n      cost,float,set,345\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("mismatch") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon",
+        "symbols:\n  properties[2]{name,id,source}:\n"
+        "    cost,0x01,test\n    cost,0x02,test\n" + namedPatch);
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("Duplicate symbol") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon", symbols +
+        "patches[1]:\n  - target:\n      name: sanitizer\n"
+        "    properties[1]{name,type,operation,value}:\n      unknown,float,set,345\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("Unknown property") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon",
+        "symbols:\n  properties[1]{name,id}:\n    cost,0x01\n" + namedPatch);
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("source") != std::string::npos);
+    WriteTextFile(directory / L"overrides.toon", symbols +
+        "patches[1]:\n  - target:\n      name: sanitizer\n"
+        "    properties[2]{id,type,operation,value}:\n"
+        "      0x09AE19D7,float,set,345\n      0x09AE19D7,float,set,346\n");
+    SC13_EXPECT(!sc13::mods::LoadModDefinition(directory, definition, error));
+    SC13_EXPECT(error.find("same property twice") != std::string::npos);
+
     WriteTextFile(
         directory / L"mod.toon",
         "id: Invalid.Id\nname: Invalid\nversion: 1.0.0\n");
@@ -725,6 +793,12 @@ void TestModManager() {
     SC13_EXPECT(manager.EnabledOrder().size() == 1U);
     const sc13::core::Tgi target{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
     SC13_EXPECT(runtimeRefreshCount == 1U);
+    WriteTextFile(sanitizer / L"symbols.toon",
+        "symbols:\n  properties[1]{name,id,source}:\n    cost,0x09AE19D7,fixture\n");
+    SC13_EXPECT(manager.Refresh(error));
+    SC13_EXPECT(manager.Snapshot().front().state == sc13::mods::ModState::Changed);
+    SC13_EXPECT(std::filesystem::remove(sanitizer / L"symbols.toon"));
+    SC13_EXPECT(manager.Refresh(error));
     SC13_EXPECT(lastRuntimeRefresh.contains(target));
     SC13_EXPECT(
         registry.Current()->Find(target)->front().patch.properties.front().value ==
@@ -881,6 +955,112 @@ void TestModManager() {
     return bytes;
 }
 
+/** @summary Exercises offline source ambiguity, runtime arithmetic, reload order and failure evidence. */
+void TestDeveloperWorkflow() {
+    const auto root = CreateTemporaryDirectory();
+    const auto game = root / L"game";
+    const auto modsPath = root / L"mods";
+    std::filesystem::create_directory(game);
+    const sc13::core::Tgi target{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
+    std::vector<std::byte> prop;
+    AppendBigU32(prop, 1); AppendBigU32(prop, 0x09AE19D7U);
+    AppendBigU16(prop, 0x0DU); AppendBigU16(prop, 0);
+    AppendBigU32(prop, std::bit_cast<std::uint32_t>(300.0F));
+    const auto bytes = BuildSyntheticDbpf(target, prop, false);
+    {
+        std::ofstream output(game / L"vanilla.package", std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    WriteModFixture(modsPath / L"first", "fixture.first", "First", 345.0F);
+    WriteModFixture(modsPath / L"second", "fixture.second", "Second", 5.0F);
+    sc13::mods::ModDefinition first, second;
+    std::string error;
+    SC13_EXPECT(sc13::mods::LoadModDefinition(modsPath / L"first", first, error));
+    SC13_EXPECT(sc13::mods::LoadModDefinition(modsPath / L"second", second, error));
+    second.patches.front().properties.front().operation = sc13::mods::PatchOperation::Add;
+    const std::array definitions{first, second};
+    auto report = sc13::dev::ValidateMods(definitions, game);
+    SC13_EXPECT(report.valid);
+    SC13_EXPECT(report.steps.size() == 2U);
+    SC13_EXPECT(report.steps.front().before == 300.0F);
+    SC13_EXPECT(report.steps.back().after == 350.0F);
+    SC13_EXPECT(report.conflicts.size() == 1U);
+    SC13_EXPECT(report.resources.front().resourceSha256.size() == 64U);
+    SC13_EXPECT(sc13::dev::ValidationJson(report).find("\"after\":350") != std::string::npos);
+    std::filesystem::copy_file(game / L"vanilla.package", game / L"duplicate.package");
+    report = sc13::dev::ValidateMods(definitions, game);
+    SC13_EXPECT(!report.valid);
+    SC13_EXPECT(report.resources.front().packages.size() == 2U);
+    SC13_EXPECT(report.resources.front().error.find("Ambiguous") != std::string::npos);
+    std::filesystem::remove(game / L"duplicate.package");
+    auto missing = first;
+    missing.patches.front().properties.front().propertyId = 1;
+    report = sc13::dev::ValidateMods(std::span(&missing, 1), game);
+    SC13_EXPECT(!report.valid);
+    missing.patches.front().target.instance = 1;
+    report = sc13::dev::ValidateMods(std::span(&missing, 1), game);
+    SC13_EXPECT(!report.valid);
+    SC13_EXPECT(report.resources.front().error == "Target resource not found");
+
+    sc13::mods::PatchRegistry registry;
+    sc13::runtime::RuntimeResourceCache cache;
+    sc13::mods::ModManager manager(modsPath, root / L"state.toon", registry, cache);
+    SC13_EXPECT(manager.Initialize(error));
+    SC13_EXPECT(manager.SetEnabled("fixture.first", true, error));
+    SC13_EXPECT(manager.SetEnabled("fixture.second", true, error));
+    const auto oldSnapshot = registry.Current();
+    const auto oldOrder = manager.EnabledOrder();
+    const sc13::runtime::RuntimeResourceKey key{target, 1234};
+    const std::array table{sc13::core::RuntimePropertyRecord{0x09AE19D7U, std::bit_cast<std::uint32_t>(300.0F), {}, 0x000D0000U}};
+    sc13::runtime::RuntimeResourceBuildPlan plan;
+    SC13_EXPECT(cache.Prepare(key, table, oldSnapshot->generation(), *oldSnapshot->Find(target), plan, error));
+    SC13_EXPECT(cache.Commit(plan, error));
+    SC13_EXPECT(cache.Observations().front().status == "applied");
+    WriteModFixture(modsPath / L"first", "fixture.first", "First", 400.0F);
+    SC13_EXPECT(manager.Refresh(error));
+    SC13_EXPECT(manager.Snapshot().front().canReload);
+    SC13_EXPECT(!manager.Reload("fixture.first", error, "stale-preview"));
+    SC13_EXPECT(manager.Generation() == oldSnapshot->generation());
+    SC13_EXPECT(manager.Reload("fixture.first", error));
+    SC13_EXPECT(manager.EnabledOrder() == oldOrder);
+    SC13_EXPECT(registry.Current()->generation() == oldSnapshot->generation() + 1U);
+    SC13_EXPECT(registry.Current()->Find(target)->front().owner == "fixture.first");
+    SC13_EXPECT(oldSnapshot->Find(target)->front().patch.properties.front().value == 345.0F);
+    SC13_EXPECT(registry.Current()->Find(target)->front().patch.properties.front().value == 400.0F);
+    SC13_EXPECT(cache.Observations().front().status == "pending");
+    const auto stableGeneration = manager.Generation();
+    WriteTextFile(modsPath / L"first" / L"overrides.toon", "patches: invalid\n");
+    SC13_EXPECT(!manager.Reload("fixture.first", error));
+    SC13_EXPECT(manager.Generation() == stableGeneration);
+    SC13_EXPECT(registry.IsActive("fixture.first"));
+    WriteTextFile(modsPath / L"first" / L"overrides.toon",
+        "patches[1]:\n  - target:\n      type: 0x00B1B104\n      group: 0x61EFC000\n      instance: 0x719436BD\n"
+        "    properties[1]{id,type,operation,value}:\n      0x01,float,set,5\n");
+    SC13_EXPECT(!manager.Reload("fixture.first", error));
+    SC13_EXPECT(manager.Generation() == stableGeneration);
+    cache.RecordFailure(key, stableGeneration, "fixture rejection");
+    const auto diagnostic = sc13::dev::RuntimeDiagnosticsJson(manager, 123);
+    SC13_EXPECT(diagnostic.find("fixture rejection") != std::string::npos);
+    SC13_EXPECT(diagnostic.find("historical committed resource values") != std::string::npos);
+    WriteModFixture(modsPath / L"first", "fixture.first", "First", 450.0F);
+    const auto diagnosticPath = root / L"runtime-status.json";
+    {
+        sc13::dev::RuntimeDiagnostics watcher(manager, diagnosticPath);
+        for (unsigned int attempt = 0; attempt < 100U && !std::filesystem::exists(diagnosticPath); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        SC13_EXPECT(std::filesystem::exists(diagnosticPath));
+        SC13_EXPECT(manager.Snapshot().front().canReload);
+        SC13_EXPECT(manager.Snapshot().front().pendingPatches.front().properties.front().value == 450.0F);
+        SC13_EXPECT(manager.Generation() == stableGeneration);
+    }
+    SC13_EXPECT(!std::filesystem::exists(diagnosticPath));
+    SC13_EXPECT(sc13::core::JsonString("a\n\"b") == "\"a\\u000a\\\"b\"");
+    cache.Clear(); SC13_EXPECT(cache.Observations().empty());
+    std::error_code cleanupError;
+    std::filesystem::remove_all(root, cleanupError);
+    SC13_EXPECT(!cleanupError);
+}
+
 /** Validates DBPF header, index, TGI lookup, and exact extraction. */
 void TestDbpf() {
     const sc13::core::Tgi tgi{0x00B1B104U, 0x61EFC000U, 0x719436BDU};
@@ -958,6 +1138,12 @@ void TestPeFile() {
 
 /** Executes deterministic unit tests without a third-party framework. */
 int main() {
+    /** @summary Verifies the shipped named mod using the same production parser. */
+    sc13::mods::ModDefinition packagedDefinition;
+    std::string packagedError;
+    SC13_EXPECT(sc13::mods::LoadModDefinition(
+        std::filesystem::path(SC13_SOURCE_DIR) / "packaging/BetterSanitizer",
+        packagedDefinition, packagedError));
     TestTgi();
     TestResourceFilter();
     TestSignature();
@@ -974,6 +1160,7 @@ int main() {
     TestModStateStore();
     TestModManager();
     TestDbpf();
+    TestDeveloperWorkflow();
     TestPeFile();
     if (g_failures == 0) {
         std::cout << "All SC13 tests passed.\n";

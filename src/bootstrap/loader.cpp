@@ -2,6 +2,7 @@
 
 #include "config/loader_config.hpp"
 #include "core/sha256.hpp"
+#include "dev/runtime_diagnostics.hpp"
 #include "hooks/file_trace.hpp"
 #include "hooks/resource_trace.hpp"
 #include "logging/async_logger.hpp"
@@ -33,6 +34,7 @@ std::atomic_bool g_initialized = false;
 std::unique_ptr<mods::PatchRegistry> g_patchRegistry;
 std::unique_ptr<runtime::RuntimeResourceCache> g_resourceCache;
 std::unique_ptr<mods::ModManager> g_modManager;
+std::unique_ptr<dev::RuntimeDiagnostics> g_runtimeDiagnostics;
 config::LoaderConfig g_loaderConfig;
 
 /** Resolves the injected DLL path for colocated logs and diagnostics. */
@@ -53,6 +55,7 @@ config::LoaderConfig g_loaderConfig;
 
 /** Releases high-level mod services after all hooks have stopped using them. */
 void ResetModServices() noexcept {
+    g_runtimeDiagnostics.reset();
     g_modManager.reset();
     g_resourceCache.reset();
     g_patchRegistry.reset();
@@ -255,6 +258,13 @@ extern "C" DWORD WINAPI SC13_Initialize(void*) noexcept {
             Level::Info,
             "Runtime patches are exact-build/TGI/type gated, rebuild from retained vanilla, "
             "and never write package files");
+        try {
+            sc13::bootstrap::g_runtimeDiagnostics = std::make_unique<sc13::dev::RuntimeDiagnostics>(
+                *sc13::bootstrap::g_modManager, simoderDirectory / L"logs" / L"runtime-status.json");
+        } catch (...) {
+            AsyncLogger::Instance().Write(Level::Warning,
+                "Developer snapshot/watch worker unavailable; runtime mods remain enabled");
+        }
         return 0;
     } catch (...) {
         AsyncLogger::Instance().Write(
@@ -264,6 +274,7 @@ extern "C" DWORD WINAPI SC13_Initialize(void*) noexcept {
 }
 
 extern "C" DWORD WINAPI SC13_Shutdown(void*) noexcept {
+    sc13::bootstrap::g_runtimeDiagnostics.reset();
     sc13::hooks::UninstallTraceHooks();
 #if defined(SC13_ENABLE_DISCOVERY_TRACE)
     sc13::runtime::StopImageObserver();

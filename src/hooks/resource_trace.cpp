@@ -274,6 +274,27 @@ private:
     return written && committed;
 }
 
+/** @summary Logs semantic identities and committed resource values without attributing the final value to one mod. */
+void LogResolvedPatches(
+    std::span<const mods::RegisteredPatch> patches,
+    const runtime::RuntimeResourceBuildPlan& plan) {
+    if (plan.status == runtime::RuntimeResourceBuildStatus::Reused) return;
+    for (const auto& registered : patches) {
+        for (const auto& property : registered.patch.properties) {
+            const auto vanilla = core::ReadRuntimeFloat(plan.vanilla, property.propertyId);
+            const auto finalValue = core::ReadRuntimeFloat(plan.desired, property.propertyId);
+            if (!vanilla || !finalValue) continue;
+            logging::AsyncLogger::Instance().WriteEventFormat(
+                logging::Level::Patch, logging::SourceType::Mod, registered.owner.c_str(),
+                "Resolved resource=%s TGI=%s property=%s id=0x%08X operation=%s operand=%.9g "
+                "vanilla=%.9g resourceFinal=%.9g source=%s resourceSource=%s",
+                registered.patch.name.c_str(), core::ToString(plan.key.target).c_str(),
+                property.name.c_str(), property.propertyId, mods::PatchOperationName(property.operation),
+                property.value, *vanilla, *finalValue, property.source.c_str(), registered.patch.source.c_str());
+        }
+    }
+}
+
 /** Rebuilds one matched resource from retained vanilla and the current registry snapshot. */
 void PatchDeserializedResource(
     void* resource,
@@ -303,6 +324,7 @@ void PatchDeserializedResource(
         std::vector<core::RuntimePropertyRecord> current;
         std::string error;
         if (!ReadPropertyTable(prefix, current, error)) {
+            g_cache->RecordFailure(key, snapshot->generation(), error);
             logging::AsyncLogger::Instance().WriteFormat(
                 logging::Level::Error,
                 "[SC13][PATCH] TGI=%s resource=%p rejected: %s; fail-open",
@@ -315,6 +337,7 @@ void PatchDeserializedResource(
         runtime::RuntimeResourceBuildPlan plan;
         if (!g_cache->Prepare(
                 key, current, snapshot->generation(), patches, plan, error)) {
+            g_cache->RecordFailure(key, snapshot->generation(), error);
             logging::AsyncLogger::Instance().WriteFormat(
                 logging::Level::Error,
                 "[SC13][PATCH] TGI=%s resource=%p rebuild rejected: %s; fail-open",
@@ -324,6 +347,7 @@ void PatchDeserializedResource(
 
         std::size_t changedCount = 0U;
         if (!ApplyAndCommitPlan(prefix, plan, changedCount, error)) {
+            g_cache->RecordFailure(key, snapshot->generation(), error.empty() ? "Concurrent memory change" : error);
             logging::AsyncLogger::Instance().WriteFormat(
                 logging::Level::Error,
                 "[SC13][PATCH] TGI=%s resource=%p transactional write refused: %s; fail-open",
@@ -338,6 +362,7 @@ void PatchDeserializedResource(
             core::ToString(target).c_str(), resource, reader,
             static_cast<unsigned long long>(snapshot->generation()), patches.size(),
             changedCount, runtime::RuntimeResourceBuildStatusName(plan.status));
+        LogResolvedPatches(patches, plan);
         for (const mods::RegisteredPatch& patch : patches) {
             logging::AsyncLogger::Instance().WriteEventFormat(
                 logging::Level::Patch,
@@ -512,6 +537,7 @@ bool RefreshRuntimeResources(
             std::vector<core::RuntimePropertyRecord> current;
             std::string resourceError;
             if (!identityValid || !ReadPropertyTable(prefix, current, resourceError)) {
+                g_cache->RecordFailure(entry.key, snapshot->generation(), "Resource identity or layout is stale");
                 ++staleResources;
                 continue;
             }
@@ -525,6 +551,7 @@ bool RefreshRuntimeResources(
             if (!g_cache->Prepare(
                     entry.key, current, snapshot->generation(), patches,
                     plan, resourceError)) {
+                g_cache->RecordFailure(entry.key, snapshot->generation(), resourceError);
                 ++failedResources;
                 logging::AsyncLogger::Instance().WriteFormat(
                     logging::Level::Warning,
@@ -536,6 +563,7 @@ bool RefreshRuntimeResources(
             std::size_t resourceChangedValues = 0U;
             if (!ApplyAndCommitPlan(
                     prefix, plan, resourceChangedValues, resourceError)) {
+                g_cache->RecordFailure(entry.key, snapshot->generation(), resourceError.empty() ? "Concurrent memory change" : resourceError);
                 ++failedResources;
                 logging::AsyncLogger::Instance().WriteFormat(
                     logging::Level::Warning,
@@ -545,6 +573,7 @@ bool RefreshRuntimeResources(
                 continue;
             }
             ++refreshedResources;
+            LogResolvedPatches(patches, plan);
             changedValues += resourceChangedValues;
             logging::AsyncLogger::Instance().WriteFormat(
                 logging::Level::Patch,

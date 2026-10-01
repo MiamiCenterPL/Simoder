@@ -1,10 +1,13 @@
 #include "mods/mod_definition_parser.hpp"
 
 #include "formats/toon/toon_document.hpp"
+#include "core/json.hpp"
 
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <map>
 #include <set>
 #include <string_view>
 
@@ -12,6 +15,16 @@ namespace sc13::mods {
 namespace {
 
 using ToonObject = formats::toon::Value::Object;
+
+/** @summary Stores per-document names resolved before runtime patch registration. */
+struct NameCatalog final {
+    std::map<std::string, std::uint32_t, std::less<>> properties;
+    std::map<std::string, core::Tgi, std::less<>> resources;
+    std::map<std::string, std::string, std::less<>> propertySources;
+    std::map<std::string, std::string, std::less<>> resourceSources;
+    std::map<std::string, PropertyPatch, std::less<>> metadata;
+    std::map<std::string, std::string, std::less<>> declaredTypes;
+};
 
 /** Formats a bounded TOON parser diagnostic for one named mod file. */
 [[nodiscard]] std::string FormatParseError(
@@ -201,25 +214,111 @@ using ToonObject = formats::toon::Value::Object;
     return true;
 }
 
-/** Maps one validated property object into a typed operation. */
+/** @summary Resolves an optional name and verifies any accompanying numeric identity. */
+[[nodiscard]] bool ResolveProperty(
+    const ToonObject& object, const NameCatalog& catalog,
+    std::uint32_t& id, std::string& error) {
+    if (Find(object, "name") == nullptr) {
+        return ReadUint32(object, "id", id, error);
+    }
+    std::string name;
+    if (!ReadRequiredString(object, "name", 128U, name, error)) return false;
+    const auto match = catalog.properties.find(name);
+    if (match == catalog.properties.end()) {
+        error = "Unknown property name '" + name + "'";
+        return false;
+    }
+    if (Find(object, "id") != nullptr &&
+        (!ReadUint32(object, "id", id, error) || id != match->second)) {
+        if (error.empty()) error = "Property name/id mismatch for '" + name + "'";
+        return false;
+    }
+    id = match->second;
+    return true;
+}
+
+/** @summary Reads an exact TGI without hashing or inferring resource names. */
+[[nodiscard]] bool ReadTarget(const ToonObject& object, core::Tgi& target, std::string& error) {
+    return ReadUint32(object, "type", target.type, error) &&
+        ReadUint32(object, "group", target.group, error) &&
+        ReadUint32(object, "instance", target.instance, error);
+}
+
+/** @summary Loads explicit resource/property aliases with mandatory provenance. */
+[[nodiscard]] bool ParseNames(const ToonObject& root, NameCatalog& catalog, std::string& error) {
+    const auto* value = Find(root, "symbols");
+    if (value == nullptr) return true;
+    const auto* symbols = value->AsObject();
+    if (symbols == nullptr) { error = "symbols must be an object"; return false; }
+    for (const std::string_view kind : {"properties", "resources"}) {
+        const auto* entries = Find(*symbols, kind);
+        if (entries == nullptr) continue;
+        const auto* array = entries->AsArray();
+        if (array == nullptr) { error = "symbols entries must be arrays"; return false; }
+        for (const auto& entry : *array) {
+            const auto* object = entry.AsObject();
+            std::string name, source;
+            if (object == nullptr) { error = "symbol must be an object"; return false; }
+            if (!ReadRequiredString(*object, "name", 128U, name, error) ||
+                !ReadRequiredString(*object, "source", 1024U, source, error)) return false;
+            bool inserted = false;
+            if (kind == "properties") {
+                std::uint32_t id{};
+                if (!ReadUint32(*object, "id", id, error)) return false;
+                inserted = catalog.properties.emplace(name, id).second;
+                catalog.propertySources.emplace(name, source);
+                PropertyPatch metadata;
+                std::string declaredType;
+                if (!ReadOptionalString(*object, "description", 4096U, metadata.description, error) ||
+                    !ReadOptionalString(*object, "unit", 64U, metadata.unit, error) ||
+                    !ReadOptionalString(*object, "origin", 64U, metadata.origin, error) ||
+                    !ReadOptionalString(*object, "type", 64U, declaredType, error)) return false;
+                catalog.metadata.emplace(name, std::move(metadata));
+                catalog.declaredTypes.emplace(name, std::move(declaredType));
+            } else {
+                core::Tgi target{};
+                if (!ReadTarget(*object, target, error)) return false;
+                inserted = catalog.resources.emplace(name, target).second;
+                catalog.resourceSources.emplace(name, source);
+            }
+            if (!inserted) { error = "Duplicate symbol name '" + name + "'"; return false; }
+        }
+    }
+    return true;
+}
+
+/** @summary Maps a named or numeric property into a typed operation. */
 [[nodiscard]] bool ParsePropertyPatch(
     const ToonObject& object,
+    const NameCatalog& catalog,
     PropertyPatch& patch,
     std::string& error) {
     PropertyPatch parsed;
-    if (!ReadUint32(object, "id", parsed.propertyId, error) ||
+    if (!ResolveProperty(object, catalog, parsed.propertyId, error) ||
         !ReadPropertyType(object, parsed.type, error) ||
         !ReadOperation(object, parsed.operation, error) ||
         !ReadPatchValue(object, parsed.operation, parsed.value, error)) {
         return false;
     }
-    patch = parsed;
+    if (Find(object, "name") != nullptr) {
+        if (!ReadRequiredString(object, "name", 128U, parsed.name, error)) return false;
+        parsed.source = catalog.propertySources.at(parsed.name);
+        const auto& metadata = catalog.metadata.at(parsed.name);
+        parsed.description = metadata.description; parsed.unit = metadata.unit; parsed.origin = metadata.origin;
+        const auto& declaredType = catalog.declaredTypes.at(parsed.name);
+        if (!declaredType.empty() && declaredType != "float") {
+            error = "Symbol '" + parsed.name + "' declares type '" + declaredType + "', incompatible with float patch";
+            return false;
+        }
+    }
+    patch = std::move(parsed);
     return true;
 }
 
 /** Maps one target and its property array into a resource patch definition. */
 [[nodiscard]] bool ParseResourcePatch(
     const ToonObject& object,
+    const NameCatalog& catalog,
     ResourcePatchDefinition& patch,
     std::string& error) {
     const formats::toon::Value* const targetValue = Find(object, "target");
@@ -230,9 +329,26 @@ using ToonObject = formats::toon::Value::Object;
         return false;
     }
     ResourcePatchDefinition parsed;
-    if (!ReadUint32(*target, "type", parsed.target.type, error) ||
-        !ReadUint32(*target, "group", parsed.target.group, error) ||
-        !ReadUint32(*target, "instance", parsed.target.instance, error)) {
+    if (Find(*target, "name") != nullptr) {
+        std::string name;
+        if (!ReadRequiredString(*target, "name", 128U, name, error)) return false;
+        const auto match = catalog.resources.find(name);
+        if (match == catalog.resources.end()) {
+            error = "Unknown resource name '" + name + "'";
+            return false;
+        }
+        parsed.target = match->second;
+        parsed.name = name;
+        parsed.source = catalog.resourceSources.at(name);
+        if (Find(*target, "type") || Find(*target, "group") || Find(*target, "instance")) {
+            core::Tgi explicitTarget{};
+            if (!ReadTarget(*target, explicitTarget, error)) return false;
+            if (!(explicitTarget == parsed.target)) {
+                error = "Resource name/TGI mismatch for '" + name + "'";
+                return false;
+            }
+        }
+    } else if (!ReadTarget(*target, parsed.target, error)) {
         error = "Patch target: " + error;
         return false;
     }
@@ -252,7 +368,7 @@ using ToonObject = formats::toon::Value::Object;
             return false;
         }
         PropertyPatch property;
-        if (!ParsePropertyPatch(*propertyObject, property, error)) {
+        if (!ParsePropertyPatch(*propertyObject, catalog, property, error)) {
             return false;
         }
         if (!identifiers.insert(property.propertyId).second) {
@@ -268,6 +384,7 @@ using ToonObject = formats::toon::Value::Object;
 /** Maps and validates the root patch list. */
 [[nodiscard]] bool ParseOverrides(
     const formats::toon::Document& document,
+    NameCatalog catalog,
     std::vector<ResourcePatchDefinition>& patches,
     std::string& error) {
     const formats::toon::Value* const patchesValue = Find(document.root(), "patches");
@@ -278,6 +395,7 @@ using ToonObject = formats::toon::Value::Object;
         return false;
     }
     std::set<std::pair<core::Tgi, std::uint32_t>> uniqueProperties;
+    if (!ParseNames(document.root(), catalog, error)) return false;
     std::vector<ResourcePatchDefinition> parsed;
     for (const formats::toon::Value& value : *patchArray) {
         const ToonObject* const object = value.AsObject();
@@ -286,7 +404,7 @@ using ToonObject = formats::toon::Value::Object;
             return false;
         }
         ResourcePatchDefinition patch;
-        if (!ParseResourcePatch(*object, patch, error)) {
+        if (!ParseResourcePatch(*object, catalog, patch, error)) {
             return false;
         }
         for (const PropertyPatch& property : patch.properties) {
@@ -351,7 +469,24 @@ bool LoadModDefinition(
             return false;
         }
         std::vector<ResourcePatchDefinition> patches;
-        if (!ParseOverrides(overridesDocument, patches, error)) {
+        NameCatalog catalog;
+        const auto symbolsPath = directory / L"symbols.toon";
+        std::error_code statusError;
+        const bool hasSymbols = std::filesystem::exists(symbolsPath, statusError);
+        if (statusError) { error = "symbols.toon: " + statusError.message(); return false; }
+        if (hasSymbols) {
+            formats::toon::Document symbolsDocument;
+            if (!formats::toon::LoadFile(symbolsPath, symbolsDocument, parseError)) {
+                error = FormatParseError(symbolsPath, parseError);
+                return false;
+            }
+            if (Find(symbolsDocument.root(), "symbols") == nullptr) {
+                error = "symbols.toon requires a symbols object";
+                return false;
+            }
+            if (!ParseNames(symbolsDocument.root(), catalog, error)) return false;
+        }
+        if (!ParseOverrides(overridesDocument, std::move(catalog), patches, error)) {
             error = "overrides.toon: " + error;
             return false;
         }
@@ -366,4 +501,43 @@ bool LoadModDefinition(
     }
 }
 
+bool ListSymbolsJson(const std::filesystem::path& directory, std::string_view query,
+    std::string& json, std::string& error) noexcept {
+    try {
+        error.clear(); json.clear(); NameCatalog catalog;
+        for (const auto* filename : {L"symbols.toon", L"overrides.toon"}) {
+            std::error_code statusError;
+            const auto path = directory / filename;
+            const bool exists = std::filesystem::exists(path, statusError);
+            if (statusError) { error = statusError.message(); return false; }
+            if (!exists) continue;
+            formats::toon::Document document;
+            formats::toon::ParseError parseError;
+            if (!formats::toon::LoadFile(path, document, parseError)) { error = FormatParseError(path, parseError); return false; }
+            if (!ParseNames(document.root(), catalog, error)) return false;
+        }
+        json = "{\"schemaVersion\":1,\"symbols\":[";
+        bool comma = false;
+        for (const auto& [name, id] : catalog.properties) {
+            char identifier[11]{};
+            std::snprintf(identifier, sizeof(identifier), "0x%08X", id);
+            if (!query.empty() && name.find(query) == std::string::npos && std::string_view(identifier).find(query) == std::string::npos) continue;
+            if (comma) json += ','; comma = true;
+            const auto& metadata = catalog.metadata.at(name);
+            json += "{\"kind\":\"property\",\"name\":" + core::JsonString(name) + ",\"id\":" + core::JsonString(identifier) +
+                ",\"type\":" + core::JsonString(catalog.declaredTypes.at(name)) + ",\"source\":" + core::JsonString(catalog.propertySources.at(name)) +
+                ",\"description\":" + core::JsonString(metadata.description) + ",\"unit\":" + core::JsonString(metadata.unit) +
+                ",\"origin\":" + core::JsonString(metadata.origin) + "}";
+        }
+        for (const auto& [name, target] : catalog.resources) {
+            const auto tgi = core::ToString(target);
+            if (!query.empty() && name.find(query) == std::string::npos && tgi.find(query) == std::string::npos) continue;
+            if (comma) json += ','; comma = true;
+            json += "{\"kind\":\"resource\",\"name\":" + core::JsonString(name) + ",\"tgi\":" + core::JsonString(tgi) +
+                ",\"source\":" + core::JsonString(catalog.resourceSources.at(name)) + "}";
+        }
+        json += "]}\n";
+        return true;
+    } catch (...) { json.clear(); error = "Could not read catalog"; return false; }
+}
 }  // namespace sc13::mods

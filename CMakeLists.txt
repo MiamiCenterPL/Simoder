@@ -35,6 +35,8 @@ add_library(sc13_core STATIC
     src/core/runtime_property_table.cpp
     src/core/sha256.cpp
     src/core/tgi.cpp
+    src/dev/mod_validation.cpp
+    src/dev/runtime_diagnostics.cpp
     src/formats/dbpf/dbpf_reader.cpp
     src/formats/dbpf/refpack.cpp
     src/formats/prop/prop_document.cpp
@@ -57,6 +59,9 @@ sc13_enable_warnings(sc13_core)
 add_executable(sc13-inspect tools/inspect/main.cpp)
 target_link_libraries(sc13-inspect PRIVATE sc13_core)
 sc13_enable_warnings(sc13-inspect)
+add_executable(simoder-dev tools/dev/main.cpp)
+target_link_libraries(simoder-dev PRIVATE sc13_core)
+sc13_enable_warnings(simoder-dev)
 
 add_executable(sc13-pe-probe tools/pe_probe/main.cpp)
 target_link_libraries(sc13-pe-probe PRIVATE sc13_core)
@@ -196,9 +201,14 @@ if(SC13_BUILD_RUNTIME)
             VERBATIM
         )
         install(
-            TARGETS sc13-inspect sc13-pe-probe sc13-memory-probe
+            TARGETS sc13-inspect sc13-pe-probe sc13-memory-probe simoder-dev
             RUNTIME DESTINATION simoder/DevTools
         )
+        install(FILES tools/symbols/import_symbols.py DESTINATION simoder/DevTools/Symbols)
+        install(FILES tools/symbols/openscp_diff.py DESTINATION simoder/DevTools/Symbols)
+        install(FILES devtools/vscode/package.json devtools/vscode/extension.js
+            devtools/vscode/helpers.js devtools/vscode/snippets.json devtools/vscode/README.md
+            DESTINATION simoder/DevTools/VSCode)
         configure_file(
             cmake/InstallAiDevTools.cmake.in
             "${CMAKE_CURRENT_BINARY_DIR}/InstallAiDevTools.cmake"
@@ -221,6 +231,18 @@ if(SC13_BUILD_TESTS)
     target_link_libraries(sc13-tests PRIVATE sc13_core)
     sc13_enable_warnings(sc13-tests)
     add_test(NAME sc13-tests COMMAND sc13-tests)
+    target_compile_definitions(sc13-tests PRIVATE SC13_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME sc13-symbol-import-tests COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/symbols/test_import_symbols.py")
+        set_tests_properties(sc13-symbol-import-tests PROPERTIES
+            ENVIRONMENT "SC13_MOD_INSPECTOR=$<TARGET_FILE:sc13-inspect>")
+    endif()
+    find_program(SC13_NODE_EXECUTABLE node)
+    if(SC13_NODE_EXECUTABLE)
+        add_test(NAME sc13-editor-tests COMMAND "${SC13_NODE_EXECUTABLE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/devtools/vscode/helpers.test.js")
+    endif()
     if(SC13_INSTALL_DEVTOOLS)
         add_test(
             NAME simoder-devbridge-tests
@@ -237,7 +259,7 @@ if(SC13_BUILD_TESTS)
     endif()
 endif()
 
-foreach(target sc13-inspect sc13-pe-probe sc13-memory-probe sc13modloader sc13-launcher sc13-tests)
+foreach(target sc13-inspect sc13-pe-probe sc13-memory-probe simoder-dev sc13modloader sc13-launcher sc13-tests)
     if(TARGET ${target})
         set_target_properties(${target} PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"

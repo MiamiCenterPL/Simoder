@@ -1,0 +1,23 @@
+{
+  "name": "simoder-mod-tools",
+  "displayName": "Simoder Mod Tools",
+  "description": "TOON mod validation and resolved symbol completion through simoder-dev.",
+  "version": "0.1.0",
+  "publisher": "simoder",
+  "engines": { "vscode": "^1.90.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:simoder-toon", "onCommand:simoder.validateMod"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "contributes": {
+    "languages": [{ "id": "simoder-toon", "aliases": ["Simoder TOON"], "filenamePatterns": ["mod.toon", "overrides.toon", "symbols.toon"] }],
+    "commands": [{ "command": "simoder.validateMod", "title": "Simoder: Validate Current Mod" }],
+    "configuration": {
+      "title": "Simoder",
+      "properties": {
+        "simoder.executable": { "type": "string", "default": "", "description": "Absolute simoder-dev.exe path. Empty uses this workspace's build/vs2026/bin/Release/simoder-dev.exe." },
+        "simoder.gameDirectory": { "type": "string", "default": "", "description": "Optional package directory for offline validation; empty checks definitions only." }
+      }
+    },
+    "snippets": [{ "language": "simoder-toon", "path": "./snippets.json" }]
+  }
+}

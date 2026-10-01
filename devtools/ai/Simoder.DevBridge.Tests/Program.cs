@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using Simoder.DevBridge;
@@ -32,6 +33,7 @@ internal static class Program
         Run("state machine preserves startup grace and terminal errors", TestStartupGraceAndFailure);
         Run("capture result contains native MCP image", TestCaptureImageResult);
         Run("diagnostics preserve the last capture as a native MCP image", TestDiagnosticImageResult);
+        Run("runtime evidence marks stale and unverified snapshots and bounds logs", TestRuntimeEvidence);
         await RunAsync("MCP stdio handshake advertises exact tools", TestMcpToolDiscoveryAsync).ConfigureAwait(false);
         await RunAsync("Codex registration is idempotent and reversible", TestCodexRegistrationAsync).ConfigureAwait(false);
 
@@ -39,6 +41,32 @@ internal static class Program
             ? "All Simoder DevBridge tests passed."
             : $"{failures_} Simoder DevBridge test(s) failed.");
         return failures_ == 0 ? 0 : 1;
+    }
+
+    /// <summary>@summary Verifies cached evidence freshness, malformed data and exact mod-log filtering.</summary>
+    private static void TestRuntimeEvidence()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "SimoderEvidence", Guid.NewGuid().ToString("N"));
+        var logs = Path.Combine(root, "simoder", "logs");
+        Directory.CreateDirectory(logs);
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var pids = new HashSet<int> { 123 };
+            Assert(!RuntimeEvidenceReader.Read(root, pids, now).GetProperty("available").GetBoolean(), "Missing evidence must be unavailable");
+            var path = Path.Combine(logs, "runtime-status.json");
+            File.WriteAllText(path, JsonSerializer.Serialize(new { schemaVersion = 1, pid = 123,
+                generatedAtUnixMs = now.ToUnixTimeMilliseconds(), consistentGeneration = true, mods = Array.Empty<object>() }));
+            Assert(RuntimeEvidenceReader.Read(root, pids, now).GetProperty("fresh").GetBoolean(), "Fresh verified evidence rejected");
+            Assert(!RuntimeEvidenceReader.Read(root, pids, now.AddSeconds(6)).GetProperty("fresh").GetBoolean(), "Stale evidence labelled fresh");
+            Assert(!RuntimeEvidenceReader.Read(root, new HashSet<int>(), now).GetProperty("fresh").GetBoolean(), "Unverified PID labelled fresh");
+            File.WriteAllText(path, "broken JSON");
+            Assert(!RuntimeEvidenceReader.Read(root, pids, now).GetProperty("available").GetBoolean(), "Malformed evidence accepted");
+            File.WriteAllText(Path.Combine(logs, "sc13modloader.log"), "[MOD] [fixture.first] first\n[MOD] [fixture.second] second\n[MOD] [fixture.first] final\n");
+            var filtered = RuntimeEvidenceReader.ReadLogs(root, "fixture.first", 1);
+            Assert(filtered.Count == 1 && filtered[0].Contains("final", StringComparison.Ordinal), "Log filtering failed");
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 
     /// <summary>Checks Continue normalization and rejection of unused names.</summary>
@@ -350,6 +378,8 @@ internal static class Program
             "simcity_send_key",
             "simcity_start_session",
             "simcity_wait_for_stage",
+            "simoder_get_logs",
+            "simoder_get_runtime_state",
         };
         Assert(actual.SequenceEqual(expected),
             $"Unexpected MCP tool set: {string.Join(", ", actual)}");

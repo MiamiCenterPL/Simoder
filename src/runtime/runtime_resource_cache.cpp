@@ -3,6 +3,7 @@
 #include "mods/patch_registry.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 namespace sc13::runtime {
 namespace {
@@ -129,6 +130,13 @@ bool RuntimeResourceCache::Commit(
         committed.generation = plan.generation;
         committed.valid = true;
         entries_.insert_or_assign(plan.key, std::move(committed));
+        try {
+            if (observations_.size() >= 128U && !observations_.contains(plan.key)) observations_.erase(observations_.begin());
+            observations_.insert_or_assign(plan.key, RuntimeResourceObservation{plan.key, plan.generation,
+                EqualRecords(plan.vanilla, plan.desired) ? "observed_unchanged" : "applied", "", plan.vanilla, plan.desired,
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()), plan.generation});
+        } catch (...) { /* @summary Diagnostic allocation failure must not invalidate a committed memory transaction. */ }
         return true;
     } catch (...) {
         error = "Runtime resource cache commit failed due to an allocation exception";
@@ -143,6 +151,8 @@ std::size_t RuntimeResourceCache::Invalidate(
         std::size_t invalidated = 0U;
         for (const core::Tgi& target : affected) {
             ++invalidationEpochs_[target];
+            for (auto& [key, observation] : observations_)
+                if (key.target == target) observation.status = "pending";
         }
         for (auto& [key, entry] : entries_) {
             if (entry.valid && affected.contains(key.target)) {
@@ -183,8 +193,29 @@ void RuntimeResourceCache::Clear() noexcept {
         const std::scoped_lock lock(mutex_);
         entries_.clear();
         invalidationEpochs_.clear();
+        observations_.clear();
     } catch (...) {
     }
+}
+
+void RuntimeResourceCache::RecordFailure(const RuntimeResourceKey& key, mods::PatchGeneration generation,
+    std::string_view reason) noexcept {
+    try {
+        const std::scoped_lock lock(mutex_);
+        if (observations_.size() >= 128U && !observations_.contains(key)) observations_.erase(observations_.begin());
+        auto& observation = observations_[key];
+        observation.key = key; observation.generation = generation;
+        observation.status = "rejected"; observation.diagnostic = reason;
+        observation.observedAtUnixMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    } catch (...) { /* @summary Observation failure leaves patch safety and gameplay unchanged. */ }
+}
+
+std::vector<RuntimeResourceObservation> RuntimeResourceCache::Observations() const {
+    const std::scoped_lock lock(mutex_);
+    std::vector<RuntimeResourceObservation> result;
+    for (const auto& [key, observation] : observations_) { static_cast<void>(key); result.push_back(observation); }
+    return result;
 }
 
 const char* RuntimeResourceBuildStatusName(

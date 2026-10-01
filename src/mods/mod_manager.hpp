@@ -15,6 +15,7 @@
 
 namespace sc13::runtime {
 class RuntimeResourceCache;
+struct RuntimeResourceObservation;
 }
 
 namespace sc13::mods {
@@ -30,6 +31,9 @@ using RuntimeResourceRefreshCallback = std::function<bool(
 struct ModDefinitionFingerprint final {
     core::Sha256Digest manifest{};
     core::Sha256Digest overrides{};
+    /** @summary Includes optional imported catalog bytes and file presence in reload checks. */
+    core::Sha256Digest symbols{};
+    bool hasSymbols{};
 
     auto operator<=>(const ModDefinitionFingerprint&) const = default;
 };
@@ -56,6 +60,9 @@ public:
         const ModId& id,
         bool enabled,
         std::string& error) noexcept;
+    /** @summary Applies a valid pending definition without OFF/ON or activation-order changes. */
+    [[nodiscard]] bool Reload(const ModId& id, std::string& error,
+        std::string_view expectedRevision = {}) noexcept;
 
     /** Returns an immutable copy suitable for rendering outside the manager lock. */
     [[nodiscard]] std::vector<ModUiEntry> Snapshot() const;
@@ -65,6 +72,10 @@ public:
 
     /** Returns same-property conflicts from the current immutable registry snapshot. */
     [[nodiscard]] std::vector<PatchConflict> Conflicts() const;
+    /** @summary Returns historical runtime observations without reading arbitrary game memory. */
+    [[nodiscard]] std::vector<runtime::RuntimeResourceObservation> RuntimeObservations() const;
+    /** @summary Returns the current published patch generation. */
+    [[nodiscard]] PatchGeneration Generation() const noexcept;
 
 private:
     /** Retains the committed definition and an optional changed-on-disk successor. */
